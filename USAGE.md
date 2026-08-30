@@ -90,6 +90,8 @@ For a device lifecycle or caller-owned cancellation scope, use `realtime.withCan
 
 `realtime.withConnection(operation)` additionally binds work to the current connected broker session, including any parent cancellation scope. A broker disconnect invalidates the whole operation even if MQTT reconnects before delayed work resumes; it cannot publish commands against the replacement connection. This is useful when serializing multi-step controls that first wait for telemetry.
 
+Playback controls also reject a known Tonie replacement during asynchronous command preparation, before publishing. Chapter indices and millisecond positions must be nonnegative safe integers. Relative chapter and volume methods use the current cached telemetry; serialize and confirm repeated relative controls so each operation uses the preceding device result rather than repeating a stale target.
+
 ## Verification
 
 `npm run test:memory` runs realtime and audio regressions with explicit garbage collection, including 100 real MQTT connection lifecycles against an in-memory broker, 10,000 confirmed controls, retained-heap bounds, 128 MiB upload/hash fixtures, bounded reader concurrency, and failure drainage.

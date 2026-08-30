@@ -1214,6 +1214,28 @@ test("an offline update before cached control publication cancels the command", 
   assert.equal(socket.published.length, 0);
 });
 
+test("playback commands cannot target a replacement Tonie during preparation", async context => {
+  const { live, socket, send } = await fixture();
+  context.after(() => live.disconnect());
+  send("playback/state", { tonie: "ORIGINAL", chapter: 0, paused: false }, true);
+  const pending = live.seek(box.id, 1);
+  const rejected = assert.rejects(pending, /Tonie changed/);
+  send("playback/state", { tonie: "REPLACEMENT", chapter: 0, paused: false });
+  await rejected;
+  assert.equal(socket.published.length, 0);
+  assert((await live.pause(box.id)).acknowledged);
+});
+
+test("seek and relative chapters reject numbers that lose integer precision", async context => {
+  const { live, socket, send } = await fixture();
+  context.after(() => live.disconnect());
+  assert.throws(() => live.seek(box.id, Number.MAX_SAFE_INTEGER + 1), /safe integers/);
+  assert.throws(() => live.seek(box.id, 0, Number.MAX_SAFE_INTEGER + 1), /safe integers/);
+  send("playback/state", { tonie: "TONIE", chapter: Number.MAX_SAFE_INTEGER, paused: false }, true);
+  await assert.rejects(live.skip(box.id, 1), /safe integers/);
+  assert.equal(socket.published.length, 0);
+});
+
 test("real MQTT transport never replays an expired command after reconnect", { timeout: 5000 }, async context => {
   const broker = memoryBroker();
   const cloud = new TonieCloudClient({ auth: { accessToken: jwt() }, fetch: async () => response({ uuid: "account" }) });

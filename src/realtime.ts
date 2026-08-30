@@ -100,6 +100,11 @@ export function playbackPosition(playback: PlaybackState, now = Date.now()): num
   return undefined;
 }
 
+function seekPayload(chapter: number, milliseconds: number) {
+  assert(Number.isSafeInteger(chapter) && chapter >= 0 && Number.isSafeInteger(milliseconds) && milliseconds >= 0, "Use nonnegative safe integers for the zero-based chapter and milliseconds");
+  return { action: "setPosition", chapter, ms: milliseconds };
+}
+
 export class ToniesRealtime extends EventEmitter {
   readonly states = new Map<string, TonieboxState>();
   private connection?: MqttClient;
@@ -369,6 +374,7 @@ export class ToniesRealtime extends EventEmitter {
     assert(/^[a-z][a-z0-9-]*$/.test(command), "Invalid control topic");
     assert(session.controlCount < 32, "At most 32 Toniebox commands may prepare or await acknowledgment");
     const brokerSignal = session.brokerController.signal;
+    const originalTonie = this.states.get(boxId)?.playback?.tonie;
     session.controlCount++;
     try {
       const state = await this.controlState(boxId, predicate);
@@ -376,6 +382,7 @@ export class ToniesRealtime extends EventEmitter {
       brokerSignal.throwIfAborted();
       assert(this.connection === connection && connection.connected && session.brokerOnline, "Tonies realtime broker is disconnected; commands are not queued");
       assert.equal(this.states.get(boxId)?.onlineState, "connected", "Toniebox is offline; cloud wake is not supported");
+      if (command === "playback" && originalTonie) assert.equal(this.states.get(boxId)?.playback?.tonie, originalTonie, "Tonie changed before playback publication");
       const payload = createPayload(state);
       const topic = this.topic(box, `app-control/${command}`);
       const published = connection.publishAsync(topic, JSON.stringify(payload), {
@@ -438,14 +445,13 @@ export class ToniesRealtime extends EventEmitter {
 
   seek(boxId: string, chapter: number, ms = 0) {
     this.requireFeature(boxId, "playbackControls");
-    assert(Number.isInteger(chapter) && chapter >= 0 && Number.isInteger(ms) && ms >= 0, "Use a zero-based chapter and nonnegative milliseconds");
-    return this.command(boxId, "playback", { action: "setPosition", chapter, ms });
+    return this.command(boxId, "playback", seekPayload(chapter, ms));
   }
 
   async skip(boxId: string, offset: -1 | 1) {
     this.requireFeature(boxId, "playbackControls");
     assert(offset === -1 || offset === 1, "Chapter offset must be -1 or 1");
-    return this.sendCommand(boxId, "playback", state => ({ action: "setPosition", chapter: Math.max(0, state.playback!.chapter! + offset), ms: 0 }), state => Number.isInteger(state.playback?.chapter));
+    return this.sendCommand(boxId, "playback", state => seekPayload(Math.max(0, state.playback!.chapter! + offset), 0), state => Number.isInteger(state.playback?.chapter));
   }
 
   setVolume(boxId: string, level: number) {
