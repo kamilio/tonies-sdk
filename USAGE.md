@@ -78,6 +78,8 @@ For device confirmation, use `withConfirmation(boxId, topic, predicate, operatio
 
 Use `await cloud.setAuth(repairedAuth)` to adopt credentials from a new login rather than assigning the public auth field. This prevents an older in-flight refresh from replacing repaired credentials. Concurrent provider lookups and refreshes share requests; late HTTP 401 responses reuse an already rotated token instead of refreshing it again. Credential persistence is serialized, keeping only the latest waiting auth update while a write is in flight; a slow older write cannot overwrite a newer persisted login, and failed writes do not poison later saves.
 
+Live device confirmations are scoped to the current broker connection: disconnect rejects an outstanding confirmation even after broker acknowledgment, and reconnect cannot satisfy it with an unrelated later reply. Overlapping confirmed controls for the same box/topic are rejected because device replies have no request correlation IDs; await the previous action before starting another. Ordinary state observation can continue across reconnects.
+
 ## Verification
 
 `npm run test:memory` runs audio regressions with explicit garbage collection, including 128 MiB upload/hash fixtures, bounded reader concurrency, and failure drainage.

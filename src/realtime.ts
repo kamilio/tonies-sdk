@@ -46,7 +46,9 @@ export type TonieboxEvent = {
 
 type RealtimeSession = {
   controller: AbortController;
+  brokerController: AbortController;
   commands: Map<number, () => void>;
+  confirmations: Set<string>;
   brokerOnline: boolean;
   connection?: MqttClient;
   dispose?: () => void;
@@ -96,7 +98,7 @@ export class ToniesRealtime extends EventEmitter {
     assert(!this.session, "Realtime client is already connected or connecting");
     const supported = boxes.filter(box => tonieboxCapabilities(box).realtime);
     assert(supported.length, "These Tonieboxes do not support realtime controls");
-    const session: RealtimeSession = { controller: new AbortController(), commands: new Map(), brokerOnline: false };
+    const session: RealtimeSession = { controller: new AbortController(), brokerController: new AbortController(), commands: new Map(), confirmations: new Set(), brokerOnline: false };
     this.session = session;
     let ready = false;
     try {
@@ -127,12 +129,14 @@ export class ToniesRealtime extends EventEmitter {
         if (!session.controller.signal.aborted) this.emit("message", topic, payload, packet);
       };
       const connected = () => {
+        if (session.brokerController.signal.aborted) session.brokerController = new AbortController();
         session.brokerOnline = true;
         this.emit("connected");
       };
       const disconnected = () => {
         if (!session.brokerOnline) return;
         session.brokerOnline = false;
+        session.brokerController.abort(new Error("Tonies realtime broker disconnected before device confirmation"));
         for (const cancel of session.commands.values()) cancel();
         for (const [boxId, previous] of this.states) {
           const state = { onlineState: "unknown" };
@@ -158,6 +162,7 @@ export class ToniesRealtime extends EventEmitter {
       };
       await connection.subscribeAsync([...this.routes.keys()], { qos: 1 });
       session.controller.signal.throwIfAborted();
+      assert(connection.connected, "Tonies realtime connection lost during subscription");
       ready = true;
       connected();
     } finally {
@@ -218,7 +223,11 @@ export class ToniesRealtime extends EventEmitter {
     if (!options.fresh && !options.live && predicate(current)) return current;
     assert(this.waiterCount < 256, "At most 256 state confirmations may wait concurrently");
     const controller = new AbortController();
-    const signal = AbortSignal.any([controller.signal, this.session.controller.signal, ...options.signal ? [options.signal] : []]);
+    const signal = AbortSignal.any([
+      controller.signal, this.session.controller.signal,
+      ...options.live ? [this.session.brokerController.signal] : [],
+      ...options.signal ? [options.signal] : []
+    ]);
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     let resolveState!: (state: TonieboxState) => void;
     let rejectState!: (error: unknown) => void;
@@ -258,15 +267,25 @@ export class ToniesRealtime extends EventEmitter {
 
   async withConfirmation<Result extends object>(boxId: string, topic: typeof TONIES_STATE_TOPICS[number], predicate: (state: TonieboxState) => boolean, operation: () => Promise<Result>, timeoutMs = 10000) {
     assert(this.session && this.boxes.has(boxId), "Connect to this Toniebox first");
+    assert(this.session.brokerOnline && this.connection?.connected, "Tonies realtime broker disconnected; cannot start device confirmation");
     assert(TONIES_STATE_TOPICS.includes(topic), "Confirm against a subscribed state topic");
     assert(this.waiterCount < 256, "At most 256 state confirmations may wait concurrently");
+    const confirmations = this.session.confirmations;
+    const key = JSON.stringify([boxId, topic]);
+    assert(!confirmations.has(key), "A device confirmation is already pending for this Toniebox topic");
+    confirmations.add(key);
+    const brokerSignal = this.session.brokerController.signal;
     const controller = new AbortController();
     const confirmed = this.waitForState(boxId, predicate, timeoutMs, { fresh: true, live: true, topic, signal: controller.signal });
     try {
-      const [result, state] = await Promise.all([Promise.resolve().then(operation), confirmed]);
+      const [result, state] = await Promise.all([Promise.resolve().then(() => {
+        brokerSignal.throwIfAborted();
+        return operation();
+      }), confirmed]);
       return { ...result, state, deviceConfirmed: true as const };
     } finally {
       controller.abort();
+      confirmations.delete(key);
     }
   }
 
@@ -362,6 +381,7 @@ export class ToniesRealtime extends EventEmitter {
 
   private async closeSession(session: RealtimeSession): Promise<void> {
     session.controller.abort();
+    session.brokerController.abort();
     for (const cancel of session.commands.values()) cancel();
     session.dispose?.();
     if (session.connection) session.ending ??= session.connection.endAsync(true);

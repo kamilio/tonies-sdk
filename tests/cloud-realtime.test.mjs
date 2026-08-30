@@ -516,6 +516,106 @@ test("broker loss cancels pending commands and invalidates retained box state", 
   await live.disconnect();
 });
 
+test("broker loss rejects acknowledged commands still awaiting physical confirmation", async context => {
+  const { live, socket, send } = await fixture();
+  context.after(() => live.disconnect());
+  let acknowledged = false;
+  const confirmation = live.withConfirmation(box.id, "app-reply/bedtime-state", state => state.bedtime?.stl?.state === "on", async () => {
+    const result = await live.sleepTimer(box.id, 1800);
+    acknowledged = true;
+    return result;
+  }, 50);
+  const rejected = assert.rejects(confirmation, /broker disconnected/);
+  await new Promise(resolve => setImmediate(resolve));
+  assert(acknowledged);
+  socket.connected = false;
+  socket.emit("close");
+  await rejected;
+  assert.equal(live.listenerCount("state"), 0);
+  assert.equal(live.listenerCount("error"), 0);
+  const observed = live.waitForState(box.id, state => state.onlineState === "connected");
+  socket.connected = true;
+  socket.emit("connect");
+  send("online-state", { onlineState: "connected" }, true);
+  await observed;
+  const next = live.withConfirmation(box.id, "app-reply/bedtime-state", state => state.bedtime?.stl?.state === "on", () => live.sleepTimer(box.id, 1800));
+  await new Promise(resolve => setImmediate(resolve));
+  send("app-reply/bedtime-state", { stl: { state: "on" } });
+  assert.equal((await next).deviceConfirmed, true);
+});
+
+test("confirmations cannot execute operations while the broker is disconnected", async context => {
+  const { live, socket } = await fixture();
+  context.after(() => live.disconnect());
+  socket.connected = false;
+  socket.emit("close");
+  let operations = 0;
+  await assert.rejects(live.withConfirmation(box.id, "volume/state", () => true, async () => { operations++; return {}; }, 1), /broker disconnected/);
+  assert.equal(operations, 0);
+});
+
+test("disconnect before a confirmation operation starts prevents its execution", async context => {
+  const { live, socket } = await fixture();
+  context.after(() => live.disconnect());
+  let operations = 0;
+  const confirmation = live.withConfirmation(box.id, "volume/state", () => true, async () => { operations++; return {}; });
+  socket.connected = false;
+  socket.emit("close");
+  await assert.rejects(confirmation, /broker disconnected/);
+  assert.equal(operations, 0);
+});
+
+test("explicit shutdown cancels a confirmation before its operation starts", async () => {
+  const { live } = await fixture();
+  let operations = 0;
+  const confirmation = live.withConfirmation(box.id, "volume/state", () => true, async () => { operations++; return {}; });
+  const disconnected = live.disconnect();
+  await assert.rejects(confirmation, { name: "AbortError" });
+  await disconnected;
+  assert.equal(operations, 0);
+});
+
+test("overlapping controls cannot claim the same uncorrelated device reply", async context => {
+  const { live, send } = await fixture();
+  context.after(() => live.disconnect());
+  const first = live.withConfirmation(box.id, "app-reply/bedtime-state", state => state.bedtime?.stl?.state === "on", () => live.sleepTimer(box.id, 1800));
+  const settled = Promise.allSettled([first]);
+  context.after(() => settled);
+  let duplicateOperations = 0;
+  await assert.rejects(live.withConfirmation(box.id, "app-reply/bedtime-state", () => true, async () => { duplicateOperations++; return {}; }, 50), /confirmation is already pending/);
+  assert.equal(duplicateOperations, 0);
+  const volume = live.withConfirmation(box.id, "volume/state", state => state.volume?.level === 3, () => live.setVolume(box.id, 3));
+  await new Promise(resolve => setImmediate(resolve));
+  send("app-reply/bedtime-state", { stl: { state: "on", duration: 1800 } });
+  send("volume/state", { level: 3 });
+  assert((await first).deviceConfirmed);
+  assert((await volume).deviceConfirmed);
+  const next = live.withConfirmation(box.id, "app-reply/bedtime-state", state => state.bedtime?.stl?.state === "off", () => live.sleepTimer(box.id, 0));
+  await new Promise(resolve => setImmediate(resolve));
+  send("app-reply/bedtime-state", { stl: { state: "off" } });
+  assert((await next).deviceConfirmed);
+});
+
+test("connection loss during initial subscription cannot report a ready client", async context => {
+  const subscribing = deferred();
+  const subscribed = deferred();
+  const { live, socket, cloud } = await fixture({ disconnected: true, connector: async socket => {
+    socket.subscribeAsync = async () => { subscribing.resolve(); await subscribed.promise; };
+    return socket;
+  } });
+  context.after(() => live.disconnect());
+  const connected = live.connect([box]);
+  await subscribing.promise;
+  socket.connected = false;
+  socket.emit("close");
+  subscribed.resolve();
+  await assert.rejects(connected, /connection lost during subscription/);
+  assert.equal(socket.closed, true);
+  assert.equal(cloud.listenerCount("auth"), 0);
+  assert.equal(socket.listenerCount("message"), 0);
+  assert.equal(live.states.size, 0);
+});
+
 test("at most 32 commands can occupy the outgoing MQTT store", async () => {
   const { live, socket } = await fixture();
   socket.publishAsync = (...args) => { socket.published.push(args); return new Promise(() => {}); };
