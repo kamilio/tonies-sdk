@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -29,6 +29,29 @@ test("storage auth roundtrips Playwright localStorage fields", async (t) => {
     refreshToken: "refresh",
     idToken: "id"
   });
+  if (process.platform !== "win32") assert.equal((await stat(DEFAULT_STORAGE_PATH)).mode & 0o777, 0o600);
+});
+
+test("token rotation never exposes partially written storage to concurrent readers", async context => {
+  const directory = await mkdtemp(join(tmpdir(), "tonies-sdk-atomic-auth-"));
+  const previousCwd = process.cwd();
+  context.after(async () => { process.chdir(previousCwd); await rm(directory, { recursive: true, force: true }); });
+  process.chdir(directory);
+  const preference = "x".repeat(128 * 1024);
+  await writeFile(DEFAULT_STORAGE_PATH, JSON.stringify({ cookies: [{ name: "preserved", value: "cookie" }], origins: [{ origin: "https://my.tonies.com", localStorage: [{ name: "preference", value: preference }] }] }));
+  const writing = async () => {
+    for (let index = 0; index < 100; index++) await writeStorageAuth({ accessToken: `access-${index}`, refreshToken: `refresh-${index}` });
+  };
+  const reading = async () => {
+    for (let index = 0; index < 300; index++) assert.equal(JSON.parse(await readFile(DEFAULT_STORAGE_PATH, "utf8")).cookies[0].value, "cookie");
+  };
+  const results = await Promise.allSettled([writing(), reading()]);
+  for (const result of results) assert.equal(result.status, "fulfilled", result.reason?.message);
+  assert.equal((await readStorageAuth()).refreshToken, "refresh-99");
+  const stored = JSON.parse(await readFile(DEFAULT_STORAGE_PATH, "utf8"));
+  assert.equal(stored.origins[0].localStorage.find(entry => entry.name === "preference").value, preference);
+  assert.deepEqual(await readdir(directory), [DEFAULT_STORAGE_PATH]);
+  if (process.platform !== "win32") assert.equal((await stat(DEFAULT_STORAGE_PATH)).mode & 0o777, 0o600);
 });
 
 test("partial storage omits missing tokens instead of stringifying undefined", async (t) => {

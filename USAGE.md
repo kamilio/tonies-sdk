@@ -6,6 +6,8 @@ Install from this repository with Node 20.5 or later, run `npm install`, then us
 
 Set `TONIES_EMAIL` and `TONIES_PASSWORD`, then run `tonies auth login`. The desktop CLI also reads existing Playwright storage or `TONIES_ACCESS_TOKEN` / `TONIES_REFRESH_TOKEN`. Keep `.tonies-storage.json` private. Cloud-only integrations use `TonieCloudClient` with instance-specific tokens and an `onAuth` callback; they do not use browser profiles or filesystem credentials.
 
+Desktop credential storage, identity databases, sync manifests, and remote snapshots are written to private temporary files, flushed, and atomically renamed into place. Concurrent readers see complete JSON, failed writes preserve the previous file, and token updates retain other browser-storage fields. On POSIX systems these files are owner-readable/writable only (`0600`); this does not coordinate refresh-token rotation between separate processes.
+
 Before discarding a cloud client, stop its realtime connection and other request producers, then await `cloud.flushAuth()`. This drains already-started authentication and token persistence without starting a new request, so an in-flight refresh cannot lose its rotated refresh token during teardown. Keep the persistence callback active until draining finishes, and serialize replacement clients behind that barrier. Authentication or persistence failures still reject after the pending work settles.
 
 Failed HTTP response streams are canceled before status errors are surfaced, including the final failed response after a token-refresh retry; error bodies are not downloaded into memory.

@@ -32,6 +32,7 @@ import {
   verifyChapters,
   withIdentityDatabase,
   writeIdentityDatabase,
+  writeManifest,
   writeRemoteSnapshot
 } from "../dist/client.js";
 import { clear, migrateIdentityConfigReferences, syncIdentities } from "../dist/commands.js";
@@ -253,6 +254,35 @@ test("remote snapshots keep timestamped version history per target", async () =>
   assert.equal(snapshot.remoteCount, 1);
   assert.equal(snapshot.tonie.chapters[0].title, "Before");
   assert.deepEqual((await readdir(dirname(first))).sort(), ["2026-01-02T03-04-05-006Z.json", "2026-01-02T03-04-06-006Z.json"]);
+});
+
+test("atomic JSON persistence preserves existing data and removes failed temporary files", async context => {
+  const directory = await mkdtemp(join(tmpdir(), "tonies-atomic-json-"));
+  context.after(() => rm(directory, { recursive: true, force: true }));
+  const path = join(directory, "manifest.json");
+  const manifest = { version: 1, targets: { preserved: [] } };
+  await writeManifest(path, manifest);
+  await assert.rejects(writeManifest(path, { ...manifest, unsupported: 1n }), /BigInt/);
+  assert.deepEqual(JSON.parse(await readFile(path, "utf8")), manifest);
+  assert.deepEqual(await readdir(directory), ["manifest.json"]);
+  const blocked = join(directory, "blocked.json");
+  await mkdir(blocked);
+  await writeFile(join(blocked, "preserved"), "original");
+  await assert.rejects(writeManifest(blocked, manifest));
+  assert.equal(await readFile(join(blocked, "preserved"), "utf8"), "original");
+  assert.deepEqual((await readdir(directory)).sort(), ["blocked.json", "manifest.json"]);
+});
+
+test("concurrent identity snapshots use separate atomic temporary files", async context => {
+  const directory = await mkdtemp(join(tmpdir(), "tonies-atomic-identity-"));
+  context.after(() => rm(directory, { recursive: true, force: true }));
+  const path = join(directory, "identities.json");
+  const results = await Promise.allSettled(Array.from({ length: 20 }, (_, index) => writeIdentityDatabase({ version: 1, remainingAnimals: [`animal-${index}`], identities: {}, log: [] }, path)));
+  for (const result of results) assert.equal(result.status, "fulfilled", result.reason?.message);
+  const database = await readIdentityDatabase(path);
+  assert.equal(database.version, 1);
+  assert.match(database.remainingAnimals[0], /^animal-\d+$/);
+  assert.deepEqual(await readdir(directory), ["identities.json"]);
 });
 
 test("config targets and output dir resolve supported shapes", () => {

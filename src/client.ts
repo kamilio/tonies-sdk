@@ -1,9 +1,9 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { createReadStream, existsSync, openAsBlob } from "node:fs";
-import { mkdir, open, readdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
-import { basename, dirname, extname, join, relative } from "node:path";
+import { mkdir, open, readdir, readFile, rename, rm, stat, unlink } from "node:fs/promises";
+import { basename, dirname, extname, join, relative, resolve } from "node:path";
 import { promisify } from "node:util";
 import { ClassicLevel } from "classic-level";
 import { parseFile } from "music-metadata";
@@ -227,12 +227,22 @@ export async function readIdentityDatabase(path = identityDatabasePath()): Promi
   return database;
 }
 
+async function writeJsonAtomically(path: string, value: unknown): Promise<void> {
+  const target = resolve(path);
+  await mkdir(dirname(target), { recursive: true });
+  const temporary = join(dirname(target), `.${basename(target)}.${randomUUID()}.tmp`);
+  const handle = await open(temporary, "wx", 0o600);
+  await using cleanup = { [Symbol.asyncDispose]: () => rm(temporary, { force: true }) };
+  {
+    await using writer = handle;
+    await writer.writeFile(`${JSON.stringify(value, null, 2)}\n`);
+    await writer.sync();
+  }
+  await rename(temporary, target);
+}
+
 export async function writeIdentityDatabase(database: IdentityDatabase, path = identityDatabasePath()): Promise<void> {
-  const cache = join(dirname(path), ".tonies-identities");
-  await mkdir(cache, { recursive: true });
-  const temporary = join(cache, `database-${process.pid}.json`);
-  await writeFile(temporary, `${JSON.stringify(database, null, 2)}\n`);
-  await rename(temporary, path);
+  await writeJsonAtomically(path, database);
 }
 
 export async function withIdentityDatabase<Result>(action: (database: IdentityDatabase) => Promise<Result>, path = identityDatabasePath()): Promise<Result> {
@@ -364,13 +374,14 @@ export async function readStorageAuth(): Promise<RuntimeAuth> {
 }
 
 export async function writeStorageAuth(auth: RuntimeAuth): Promise<{ path: string }> {
+  const path = resolve(DEFAULT_STORAGE_PATH);
   const tokenEntries = [
     { name: "authorization", value: auth.accessToken },
     { name: "refreshToken", value: auth.refreshToken },
     { name: "idToken", value: auth.idToken }
   ].filter((entry): entry is { name: string; value: string } => Boolean(entry.value));
   let storage: { cookies?: unknown[]; origins?: Array<{ origin: string; localStorage?: Array<{ name: string; value: string }> }> } = { cookies: [], origins: [] };
-  if (existsSync(DEFAULT_STORAGE_PATH)) storage = JSON.parse(await readFile(DEFAULT_STORAGE_PATH, "utf8"));
+  if (existsSync(path)) storage = JSON.parse(await readFile(path, "utf8"));
   storage.cookies ??= [];
   storage.origins ??= [];
   let origin = storage.origins.find((entry) => entry.origin === "https://my.tonies.com");
@@ -379,7 +390,7 @@ export async function writeStorageAuth(auth: RuntimeAuth): Promise<{ path: strin
     storage.origins.push(origin);
   }
   origin.localStorage = [...(origin.localStorage ?? []).filter((entry) => !["authorization", "refreshToken", "idToken"].includes(entry.name)), ...tokenEntries];
-  await writeFile(DEFAULT_STORAGE_PATH, `${JSON.stringify(storage, null, 2)}\n`);
+  await writeJsonAtomically(path, storage);
   return { path: DEFAULT_STORAGE_PATH };
 }
 
@@ -684,8 +695,7 @@ export async function readManifest(path: string): Promise<SyncManifest> {
 }
 
 export async function writeManifest(path: string, manifest: SyncManifest): Promise<void> {
-  await mkdir(dirname(path), { recursive: true });
-  await writeFile(path, `${JSON.stringify(manifest, null, 2)}\n`);
+  await writeJsonAtomically(path, manifest);
 }
 
 function safeSnapshotPart(value: string): string {
@@ -708,8 +718,7 @@ export async function writeRemoteSnapshot(manifestPath: string, householdId: str
     remoteCount: tonie.chapters.length,
     tonie
   };
-  await mkdir(dirname(path), { recursive: true });
-  await writeFile(path, `${JSON.stringify(snapshot, null, 2)}\n`);
+  await writeJsonAtomically(path, snapshot);
   return path;
 }
 
