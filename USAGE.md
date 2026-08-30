@@ -1,6 +1,6 @@
 # Tonies SDK and CLI
 
-Install from this repository with Node 20.5 or later, run `npm install`, then use `node dist/cli.js --help` (or the installed `tonies` executable).
+For installation directly from public GitHub, practical recipes, and the complete command/event cards, start with [README.md](README.md). This reference covers the detailed API and session contracts. Node 20.5 or later is required; no SDK registry publication is needed.
 
 ## Authentication
 
