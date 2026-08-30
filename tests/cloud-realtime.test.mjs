@@ -18,6 +18,17 @@ function deferred() {
   return { promise, resolve, reject };
 }
 
+function authTimers(context) {
+  const timers = new Set();
+  context.mock.method(globalThis, "setInterval", (callback, delay) => {
+    const timer = { callback, delay, unreferenced: false, unref() { this.unreferenced = true; return this; } };
+    timers.add(timer);
+    return timer;
+  });
+  context.mock.method(globalThis, "clearInterval", timer => timers.delete(timer));
+  return timers;
+}
+
 function memoryBroker() {
   const mqttPacket = createRequire(import.meta.resolve("mqtt"))("mqtt-packet");
   const broker = { acknowledged: false, published: [], connections: 0, accept: () => true };
@@ -55,6 +66,7 @@ async function fixture(options = {}) {
   const requests = [];
   const cloud = new TonieCloudClient({ auth: { accessToken: jwt() }, fetch: async (url, init) => {
     requests.push({ url, ...init });
+    if (url.includes("openid-connect") && options.tokenResponse) return response(options.tokenResponse);
     return response({ uuid: "account" });
   } });
   const socket = new EventEmitter();
@@ -242,6 +254,92 @@ test("realtime subscribes only known state topics with correct MQTT identity", a
   assert(socket.closed);
 });
 
+test("idle realtime connections renew credentials without REST polling", async context => {
+  const timers = authTimers(context);
+  const { cloud, socket, live, requests } = await fixture({ tokenResponse: { access_token: "renewed-token", refresh_token: "rotated-refresh", expires_in: 300 } });
+  context.after(() => live.disconnect());
+  assert.equal(timers.size, 1);
+  const [timer] = timers;
+  assert.equal(timer.delay, 30000);
+  assert(timer.unreferenced);
+  const before = requests.length;
+  timer.callback();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(requests.length, before);
+  await cloud.setAuth({ accessToken: "old-token", refreshToken: "refresh", expiresAt: Date.now() + 1000 });
+  timer.callback();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(requests.length, before + 1);
+  assert(requests.at(-1).url.includes("openid-connect"));
+  assert.equal(socket.options.password, "renewed-token");
+  assert.equal(cloud.auth.refreshToken, "rotated-refresh");
+  await live.disconnect();
+  assert.equal(timers.size, 0);
+});
+
+test("credential maintenance is single-flight and recovers after a failed lookup", async context => {
+  const timers = authTimers(context);
+  const { cloud, live } = await fixture();
+  context.after(() => live.disconnect());
+  const [timer] = timers;
+  assert(timer);
+  const reported = [];
+  live.on("error", error => reported.push(error));
+  let lookup = deferred();
+  let calls = 0;
+  context.mock.method(cloud, "accessToken", () => { calls++; return lookup.promise; });
+  for (let index = 0; index < 100; index++) timer.callback();
+  assert.equal(calls, 1);
+  lookup.reject(new Error("temporary credential failure"));
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(reported.length, 1);
+  assert.match(reported[0].message, /temporary credential failure/);
+  lookup = deferred();
+  timer.callback();
+  assert.equal(calls, 2);
+  await live.disconnect();
+  assert.equal(timers.size, 0);
+  lookup.reject(new Error("late credential failure after shutdown"));
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(reported.length, 1);
+  timer.callback();
+  assert.equal(calls, 2);
+});
+
+test("credential timers are removed after failed subscriptions and repeated reconnects", async context => {
+  const timers = authTimers(context);
+  const { live, socket } = await fixture({ disconnected: true });
+  context.after(() => live.disconnect());
+  socket.subscribeAsync = async () => { throw new Error("subscription denied"); };
+  await assert.rejects(live.connect([box]), /subscription denied/);
+  assert.equal(timers.size, 0);
+  socket.subscribeAsync = async () => {};
+  for (let index = 0; index < 50; index++) {
+    await live.connect([box]);
+    assert.equal(timers.size, 1);
+    await live.disconnect();
+    assert.equal(timers.size, 0);
+  }
+});
+
+test("credentials repaired while a socket opens are used for subsequent reconnects", async context => {
+  const opening = deferred();
+  const opened = deferred();
+  const { live, cloud, socket } = await fixture({ disconnected: true, connector: async socket => {
+    opening.resolve();
+    await opened.promise;
+    return socket;
+  } });
+  context.after(() => live.disconnect());
+  const connected = live.connect([box]);
+  await opening.promise;
+  await cloud.setAuth({ accessToken: "repaired-during-connect", expiresAt: Date.now() + 3600000 });
+  opened.resolve();
+  await connected;
+  assert.equal(socket.options.password, "repaired-during-connect");
+  assert.equal(cloud.listenerCount("auth"), 1);
+});
+
 test("play/pause/seek/volume/night controls use exact wire payloads and never retain commands", async () => {
   const { socket, live, send } = await fixture();
   send("playback/state", { tonie: "TONIE", chapter: 1, paused: false }, true);
@@ -282,6 +380,58 @@ test("commands are not queued while the broker is disconnected", async () => {
   await assert.rejects(live.pause(box.id), /not queued/);
   assert.equal(socket.published.length, 0);
   await live.disconnect();
+});
+
+test("relative controls reject disconnected brokers before waiting for missing telemetry", async context => {
+  const { live, socket } = await fixture();
+  context.after(() => live.disconnect());
+  socket.connected = false;
+  socket.emit("close");
+  const reads = context.mock.method(live, "waitForState", async () => { throw new Error("Unexpected telemetry wait"); });
+  await assert.rejects(live.skip(box.id, 1), /broker is disconnected/);
+  await assert.rejects(live.changeVolume(box.id, 1), /broker is disconnected/);
+  assert.equal(reads.mock.callCount(), 0);
+  assert.equal(socket.published.length, 0);
+});
+
+test("relative controls stop waiting when a device goes offline", async context => {
+  const { live, socket, send } = await fixture();
+  context.after(() => live.disconnect());
+  const skipped = assert.rejects(live.skip(box.id, 1), /Toniebox is offline/);
+  const changed = assert.rejects(live.changeVolume(box.id, 1), /Toniebox is offline/);
+  send("online-state", { onlineState: "offline" });
+  await Promise.all([skipped, changed]);
+  assert.equal(socket.published.length, 0);
+  assert.equal(live.listenerCount("state"), 0);
+});
+
+test("broker loss cancels relative controls waiting for telemetry", async context => {
+  const { live, socket } = await fixture();
+  context.after(() => live.disconnect());
+  const skipped = assert.rejects(live.skip(box.id, 1), /broker disconnected/);
+  const changed = assert.rejects(live.changeVolume(box.id, -1), /broker disconnected/);
+  socket.connected = false;
+  socket.emit("close");
+  await Promise.all([skipped, changed]);
+  assert.equal(socket.published.length, 0);
+  assert.equal(live.listenerCount("state"), 0);
+});
+
+test("relative controls accept retained telemetry but reject invalid step values", async context => {
+  const { live, socket, send } = await fixture();
+  context.after(() => live.disconnect());
+  const skipped = live.skip(box.id, 1);
+  send("playback/state", { chapter: 2 }, true);
+  await skipped;
+  const changed = live.changeVolume(box.id, -1);
+  send("volume/state", { level: 4 }, true);
+  await changed;
+  assert.deepEqual(socket.published.map(([, payload]) => JSON.parse(payload)), [{ action: "setPosition", chapter: 3, ms: 0 }, { level: 3 }]);
+  for (const offset of [0, 2, -2, NaN, Infinity]) {
+    await assert.rejects(live.skip(box.id, offset), /offset must be/);
+    await assert.rejects(live.changeVolume(box.id, offset), /offset must be/);
+  }
+  assert.equal(socket.published.length, 2);
 });
 
 test("concurrent connect cannot open duplicate sockets", async () => {
@@ -665,6 +815,35 @@ test("a denied reconnect can recover once credentials rotate", { timeout: 3000 }
   await reconnected.promise;
   assert(broker.connections >= 3);
   await live.waitForState(box.id, state => state.onlineState === "connected");
+});
+
+test("100 real MQTT connection lifecycles release listeners and retained heap", async context => {
+  const broker = memoryBroker();
+  const cloud = new TonieCloudClient({ auth: { accessToken: jwt() }, fetch: async () => response({ uuid: "account" }) });
+  const live = new ToniesRealtime(cloud, { connect: broker.connector });
+  context.after(() => live.disconnect());
+  await live.connect([box]);
+  await live.disconnect();
+  global.gc?.();
+  const baseline = process.memoryUsage().heapUsed;
+  const started = performance.now();
+  for (let index = 0; index < 100; index++) {
+    await live.connect([box]);
+    await live.waitForState(box.id, state => state.onlineState === "connected");
+    await live.disconnect();
+    assert.equal(live.states.size, 0);
+    assert.equal(cloud.listenerCount("auth"), 0);
+    assert.equal(broker.client.listenerCount("message"), 0);
+    assert.equal(live.listenerCount("state"), 0);
+  }
+  await new Promise(resolve => setImmediate(resolve));
+  global.gc?.();
+  await new Promise(resolve => setImmediate(resolve));
+  global.gc?.();
+  const retained = process.memoryUsage().heapUsed - baseline;
+  assert.equal(broker.connections, 101);
+  if (global.gc) assert(retained < 2 * 1024 * 1024, `MQTT lifecycle test retained ${retained} heap bytes`);
+  context.diagnostic(`100 MQTT lifecycles: ${(performance.now() - started).toFixed(1)} ms; retained heap delta ${retained} bytes${global.gc ? " after GC" : " (GC not forced)"}`);
 });
 
 test("retained snapshots and duplicate playback events never trigger false starts", async () => {

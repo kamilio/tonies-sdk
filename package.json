@@ -35,7 +35,7 @@
     "build": "tsc",
     "check": "tsc --noEmit",
     "test": "npm run build && node --test tests/*.test.mjs",
-    "test:memory": "npm run build && node --expose-gc tests/sync-plan.test.mjs"
+    "test:memory": "npm run build && node --expose-gc tests/cloud-realtime.test.mjs && node --expose-gc tests/sync-plan.test.mjs"
   },
   "dependencies": {
     "classic-level": "^3.0.0",

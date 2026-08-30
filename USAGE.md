@@ -66,11 +66,11 @@ await realtime.sleepTimer(boxes[0].id, 1800);
 await realtime.disconnect();
 ```
 
-Event snapshots include `retained`, `previous`, and `state`. Retained MQTT snapshots populate capabilities but never generate transition events; duplicate packets do not trigger repeated starts. Events include playback started/paused/ended, Tonie changes, chapter changes, online changes, and sleep-timer changes. Keep cloud tokens fresh during long-running integrations by periodically reading cloud state; refreshed tokens update MQTT reconnect credentials. Disconnect on app/device removal.
+Event snapshots include `retained`, `previous`, and `state`. Retained MQTT snapshots populate capabilities but never generate transition events; duplicate packets do not trigger repeated starts. Events include playback started/paused/ended, Tonie changes, chapter changes, online changes, and sleep-timer changes. Realtime connections check credentials every 30 seconds without polling cloud/device state; valid instance tokens require no HTTP request, while near-expiry tokens refresh and update MQTT reconnect credentials. External auth providers are queried on that schedule and retain their own refresh policy. Only one credential lookup can run at a time, and disconnect clears the unreferenced maintenance timer. Disconnect on app/device removal.
 
 Register an `error` listener when embedding the realtime client: asynchronous subscriber failures and malformed state packets are reported through that event. Raw MQTT input is also observable through `message` (topic, bytes, packet); only known subscribed topics update state, and state payloads are limited to 64 KiB. Broker loss replaces cached state with an unknown-online snapshot without firing physical-box transition events.
 
-There can be at most 32 unacknowledged control commands. A command is removed from the MQTT outgoing store on broker loss, explicit disconnect, or acknowledgment timeout (10 seconds by default), preventing delayed replay after reconnect. State waiters are canceled on explicit disconnect. Concurrent connection attempts are rejected and partially opened connections are closed.
+There can be at most 32 unacknowledged control commands. A command is removed from the MQTT outgoing store on broker loss, explicit disconnect, or acknowledgment timeout (10 seconds by default), preventing delayed replay after reconnect. Relative volume/chapter controls reject disconnected brokers before waiting for telemetry; pending control-state waits stop when the box goes offline or the broker disconnects. State waiters are canceled on explicit disconnect. Concurrent connection attempts are rejected and partially opened connections are closed.
 
 Automatic reconnect retries continue after a rejected CONNACK, allowing a later credential rotation to recover without restarting the client.
 
@@ -82,6 +82,8 @@ Live device confirmations are scoped to the current broker connection: disconnec
 
 ## Verification
 
-`npm run test:memory` runs audio regressions with explicit garbage collection, including 128 MiB upload/hash fixtures, bounded reader concurrency, and failure drainage.
+`npm run test:memory` runs realtime and audio regressions with explicit garbage collection, including 100 real MQTT connection lifecycles against an in-memory broker, a retained-heap bound, 128 MiB upload/hash fixtures, bounded reader concurrency, and failure drainage.
+
+`TONIES_LIVE_SOAK=1 node --test --test-name-pattern='read-only idle' tests/real-box.test.mjs` runs a seven-minute, read-only MQTT token-expiry soak using your existing account credentials. Boxes may remain offline; the test sends no device commands or REST state polls after connecting, and verifies credential renewal plus usable state after reconnect. It refreshes/persists authentication, so do not run multiple live auth processes against the same stored refresh token concurrently.
 
 `npm test` runs offline regressions, including MQTT wire payloads, state transitions, strict device filtering, authentication isolation/rotation, and low-level operation routing. An in-memory broker exercises the real MQTT client, including timeout removal and reconnect without command replay. Destructive live Creative-Tonie tests are opt-in. Actual playback and sleep-light effects must be verified with an online device; tests using a fake broker cannot establish hardware behavior.

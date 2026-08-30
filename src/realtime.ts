@@ -145,14 +145,32 @@ export class ToniesRealtime extends EventEmitter {
         }
         this.emit("disconnected");
       };
-      const error = (error: Error) => this.emit("error", error);
+      const error = (error: Error) => {
+        if (!session.controller.signal.aborted) this.emit("error", error);
+      };
+      const authTasks = new EventEmitter({ captureRejections: true });
+      let refreshingAuth: Promise<string> | undefined;
+      const refreshAuth = async () => {
+        refreshingAuth = this.cloud.accessToken();
+        try {
+          await refreshingAuth;
+        } finally {
+          refreshingAuth = undefined;
+        }
+      };
+      authTasks.on("error", error);
+      authTasks.on("refresh", () => { if (!refreshingAuth) return refreshAuth(); });
+      const refreshTimer = setInterval(() => authTasks.emit("refresh"), 30000).unref();
       this.cloud.on("auth", auth);
+      auth(this.cloud.auth);
       connection.on("message", message);
       connection.on("connect", connected);
       connection.on("offline", disconnected);
       connection.on("close", disconnected);
       connection.on("error", error);
       session.dispose = () => {
+        clearInterval(refreshTimer);
+        authTasks.removeAllListeners("refresh");
         this.cloud.off("auth", auth);
         connection.off("message", message);
         connection.off("connect", connected);
@@ -295,8 +313,7 @@ export class ToniesRealtime extends EventEmitter {
     const session = this.session;
     assert(box && connection && session, "Connect to this Toniebox first");
     assert(/^[a-z][a-z0-9-]*$/.test(command), "Invalid control topic");
-    const state = await this.waitForState(boxId, state => state.onlineState !== undefined);
-    assert.equal(state.onlineState, "connected", "Toniebox is offline; cloud wake is not supported");
+    await this.controlState(boxId, () => true);
     assert(this.connection === connection && connection.connected && session.brokerOnline, "Tonies realtime broker is disconnected; commands are not queued");
     assert(session.commands.size < 32, "At most 32 Toniebox commands may await acknowledgment");
     const topic = this.topic(box, `app-control/${command}`);
@@ -326,6 +343,14 @@ export class ToniesRealtime extends EventEmitter {
     assert(this.boxes.get(boxId)?.features.includes(feature), `Toniebox does not support ${feature}`);
   }
 
+  private async controlState(boxId: string, predicate: (state: TonieboxState) => boolean): Promise<TonieboxState> {
+    const session = this.session;
+    assert(session && this.connection?.connected && session.brokerOnline, "Tonies realtime broker is disconnected; commands are not queued");
+    const state = await this.waitForState(boxId, state => state.onlineState !== undefined && (state.onlineState !== "connected" || predicate(state)), 10000, { signal: session.brokerController.signal });
+    assert.equal(state.onlineState, "connected", "Toniebox is offline; cloud wake is not supported");
+    return state;
+  }
+
   play(boxId: string) {
     this.requireFeature(boxId, "playbackControls");
     return this.command(boxId, "playback", { action: "start" });
@@ -343,7 +368,9 @@ export class ToniesRealtime extends EventEmitter {
   }
 
   async skip(boxId: string, offset: -1 | 1) {
-    const state = await this.waitForState(boxId, state => Number.isInteger(state.playback?.chapter));
+    this.requireFeature(boxId, "playbackControls");
+    assert(offset === -1 || offset === 1, "Chapter offset must be -1 or 1");
+    const state = await this.controlState(boxId, state => Number.isInteger(state.playback?.chapter));
     return this.seek(boxId, Math.max(0, state.playback!.chapter! + offset));
   }
 
@@ -354,7 +381,9 @@ export class ToniesRealtime extends EventEmitter {
   }
 
   async changeVolume(boxId: string, offset: -1 | 1) {
-    const state = await this.waitForState(boxId, state => Number.isInteger(state.volume?.level));
+    this.requireFeature(boxId, "playbackControls");
+    assert(offset === -1 || offset === 1, "Volume offset must be -1 or 1");
+    const state = await this.controlState(boxId, state => Number.isInteger(state.volume?.level));
     return this.setVolume(boxId, Math.max(0, Math.min(13, state.volume!.level! + offset)));
   }
 
