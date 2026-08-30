@@ -692,8 +692,8 @@ export const tonieboxCommands = defineGroup({
       handler: async ({ params }) => withRealtime(params.target, (realtime, boxId) => realtime.setVolume(boxId, params.level))
     }),
     defineCommand({
-      name: "seek", description: "Seek to a zero-based chapter and millisecond offset",
-      positional: ["target", "chapter"], params: S.Object({ target: targetBox, chapter: S.Number({ jsonType: "integer", minimum: 0 }), ms: S.Number({ default: 0, jsonType: "integer", minimum: 0 }) }),
+      name: "seek", description: "Select a zero-based chapter; exact time seeking is not supported",
+      positional: ["target", "chapter"], params: S.Object({ target: targetBox, chapter: S.Number({ jsonType: "integer", minimum: 0 }), ms: S.Number({ default: 0, jsonType: "integer", minimum: 0, maximum: 0 }) }),
       handler: async ({ params }) => withRealtime(params.target, (realtime, boxId) => realtime.seek(boxId, params.chapter, params.ms))
     }),
     defineCommand({

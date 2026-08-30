@@ -440,19 +440,20 @@ test("play/pause/seek/volume/night controls use exact wire payloads and never re
   await live.play(box.id);
   await live.skip(box.id, 1);
   await live.skip(box.id, -1);
-  await live.seek(box.id, 2, 1234);
+  await live.seek(box.id, 2);
   await live.changeVolume(box.id, -1);
   await live.sleepTimer(box.id, 1800);
   await live.sleepTimer(box.id, 0);
   assert.deepEqual(socket.published.map(([topic, payload]) => [topic.split("/").at(-1), JSON.parse(payload)]), [
     ["playback", { action: "pause" }], ["playback", { action: "start" }],
     ["playback", { action: "setPosition", chapter: 2, ms: 0 }], ["playback", { action: "setPosition", chapter: 0, ms: 0 }],
-    ["playback", { action: "setPosition", chapter: 2, ms: 1234 }], ["volume", { level: 9 }],
+    ["playback", { action: "setPosition", chapter: 2, ms: 0 }], ["volume", { level: 9 }],
     ["stl", { state: "on", duration: 1800 }], ["stl", { state: "off" }]
   ]);
   for (const [, , options] of socket.published) assert.deepEqual(options, { qos: 1, retain: false, properties: { messageExpiryInterval: 10 } });
   assert.throws(() => live.setVolume(box.id, 14));
   assert.throws(() => live.seek(box.id, -1));
+  assert.throws(() => live.seek(box.id, 2, 1234), /Exact time seeking is not supported/);
   await live.disconnect();
 });
 

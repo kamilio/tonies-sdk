@@ -93,6 +93,7 @@ export function tonieboxCapabilities(box: Toniebox) {
     toniebox2: isToniebox2(box),
     realtime: box.generation === "tng",
     playback: box.features.includes("playbackControls"),
+    timeSeeking: false,
     sleepTimer: box.features.includes("sleepTimerAlarm"),
     nightSettings: box.features.includes("tngSettings"),
     bluetoothHeadphones: box.features.includes("bluetoothHeadphones"),

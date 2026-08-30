@@ -102,6 +102,7 @@ export function playbackPosition(playback: PlaybackState, now = Date.now()): num
 
 function seekPayload(chapter: number, milliseconds: number) {
   assert(Number.isSafeInteger(chapter) && chapter >= 0 && Number.isSafeInteger(milliseconds) && milliseconds >= 0, "Use nonnegative safe integers for the zero-based chapter and milliseconds");
+  assert.equal(milliseconds, 0, "Exact time seeking is not supported; select a chapter with milliseconds set to 0");
   return { action: "setPosition", chapter, ms: milliseconds };
 }
 

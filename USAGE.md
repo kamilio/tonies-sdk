@@ -47,7 +47,7 @@ tonies tonieboxes pause BOX
 tonies tonieboxes play BOX
 tonies tonieboxes next BOX
 tonies tonieboxes previous BOX
-tonies tonieboxes seek BOX 2 --ms 1500
+tonies tonieboxes seek BOX 2
 tonies tonieboxes volume BOX 5
 tonies tonieboxes night-mode BOX true --seconds 1800
 tonies tonieboxes night-mode BOX false
@@ -94,7 +94,7 @@ For a device lifecycle or caller-owned cancellation scope, use `realtime.withCan
 
 `realtime.withConnection(operation)` additionally binds work to the current connected broker session, including any parent cancellation scope. A broker disconnect invalidates the whole operation even if MQTT reconnects before delayed work resumes; it cannot publish commands against the replacement connection. This is useful when serializing multi-step controls that first wait for telemetry.
 
-Playback controls also reject a known Tonie replacement during asynchronous command preparation, before publishing. Chapter indices and millisecond positions must be nonnegative safe integers. Relative chapter and volume methods use the current cached telemetry; serialize and confirm repeated relative controls so each operation uses the preceding device result rather than repeating a stale target.
+Playback controls also reject a known Tonie replacement during asynchronous command preparation, before publishing. Chapter indices must be nonnegative safe integers. On the Toniebox 2 tested on August 30, 2026, a nonzero `ms` offset was ignored and the chapter restarted; high-level seeking therefore selects chapters only and rejects nonzero time offsets. A paused chapter-selection reply may omit position and duration, so chapter confirmation does not claim an exact time position. Relative chapter and volume methods use the current cached telemetry; serialize and confirm repeated relative controls so each operation uses the preceding device result rather than repeating a stale target.
 
 When a box goes offline, its playback, volume, bedtime, and headphone snapshots become unknown until new telemetry arrives; waking alone does not restore these stale values. Battery readings remain available as last-known measurements.
 
