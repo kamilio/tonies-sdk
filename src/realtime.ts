@@ -78,6 +78,7 @@ type RealtimeSession = {
   controller: AbortController;
   brokerController: AbortController;
   commands: Map<number, () => void>;
+  controlCount: number;
   confirmations: Set<string>;
   brokerOnline: boolean;
   connection?: MqttClient;
@@ -128,7 +129,7 @@ export class ToniesRealtime extends EventEmitter {
     assert(!this.session, "Realtime client is already connected or connecting");
     const supported = boxes.filter(box => tonieboxCapabilities(box).realtime);
     assert(supported.length, "These Tonieboxes do not support realtime controls");
-    const session: RealtimeSession = { controller: new AbortController(), brokerController: new AbortController(), commands: new Map(), confirmations: new Set(), brokerOnline: false };
+    const session: RealtimeSession = { controller: new AbortController(), brokerController: new AbortController(), commands: new Map(), controlCount: 0, confirmations: new Set(), brokerOnline: false };
     this.session = session;
     let ready = false;
     try {
@@ -156,7 +157,7 @@ export class ToniesRealtime extends EventEmitter {
       }
       const auth = (auth: { accessToken?: string }) => { connection.options.password = auth.accessToken; };
       const message = (topic: string, payload: Buffer, packet: IPublishPacket) => {
-        if (!session.controller.signal.aborted) this.emit("message", topic, payload, packet);
+        if (!session.controller.signal.aborted && connection.connected) this.emit("message", topic, payload, packet);
       };
       const connected = () => {
         if (session.brokerController.signal.aborted) session.brokerController = new AbortController();
@@ -343,42 +344,55 @@ export class ToniesRealtime extends EventEmitter {
     }
   }
 
-  async command(boxId: string, command: string, payload: Record<string, unknown>) {
+  command(boxId: string, command: string, payload: Record<string, unknown>) {
+    return this.sendCommand(boxId, command, () => payload);
+  }
+
+  private async sendCommand(boxId: string, command: string, createPayload: (state: TonieboxState) => Record<string, unknown>, predicate: (state: TonieboxState) => boolean = () => true) {
     const box = this.boxes.get(boxId);
     const connection = this.connection;
     const session = this.session;
     const signal = controlContext.getStore();
     assert(box && connection && session, "Connect to this Toniebox first");
     assert(/^[a-z][a-z0-9-]*$/.test(command), "Invalid control topic");
-    await this.controlState(boxId, () => true);
-    signal?.throwIfAborted();
-    assert(this.connection === connection && connection.connected && session.brokerOnline, "Tonies realtime broker is disconnected; commands are not queued");
-    assert(session.commands.size < 32, "At most 32 Toniebox commands may await acknowledgment");
-    const topic = this.topic(box, `app-control/${command}`);
-    const published = connection.publishAsync(topic, JSON.stringify(payload), {
-      qos: 1, retain: false, properties: { messageExpiryInterval: 10 }
-    });
-    const messageId = connection.getLastMessageId();
-    let cancel!: () => void;
-    const interrupted = new Promise<never>((resolve, reject) => {
-      cancel = () => {
-        if (!session.commands.delete(messageId)) return;
-        reject(new Error("Toniebox command acknowledgment interrupted or timed out; command removed from the outgoing queue"));
-        connection.removeOutgoingMessage(messageId);
-      };
-    });
-    session.commands.set(messageId, cancel);
-    const timer = setTimeout(cancel, this.options.commandTimeoutMs ?? 10000);
-    const abortListener = signal ? addAbortListener(signal, cancel) : undefined;
-    if (signal?.aborted) cancel();
+    assert(session.controlCount < 32, "At most 32 Toniebox commands may prepare or await acknowledgment");
+    const brokerSignal = session.brokerController.signal;
+    session.controlCount++;
     try {
-      await Promise.race([published, interrupted]);
+      const state = await this.controlState(boxId, predicate);
+      signal?.throwIfAborted();
+      brokerSignal.throwIfAborted();
+      assert(this.connection === connection && connection.connected && session.brokerOnline, "Tonies realtime broker is disconnected; commands are not queued");
+      assert.equal(this.states.get(boxId)?.onlineState, "connected", "Toniebox is offline; cloud wake is not supported");
+      const payload = createPayload(state);
+      const topic = this.topic(box, `app-control/${command}`);
+      const published = connection.publishAsync(topic, JSON.stringify(payload), {
+        qos: 1, retain: false, properties: { messageExpiryInterval: 10 }
+      });
+      const messageId = connection.getLastMessageId();
+      let cancel!: () => void;
+      const interrupted = new Promise<never>((resolve, reject) => {
+        cancel = () => {
+          if (!session.commands.delete(messageId)) return;
+          reject(new Error("Toniebox command acknowledgment interrupted or timed out; command removed from the outgoing queue"));
+          connection.removeOutgoingMessage(messageId);
+        };
+      });
+      session.commands.set(messageId, cancel);
+      const timer = setTimeout(cancel, this.options.commandTimeoutMs ?? 10000);
+      const abortListener = signal ? addAbortListener(signal, cancel) : undefined;
+      if (signal?.aborted) cancel();
+      try {
+        await Promise.race([published, interrupted]);
+      } finally {
+        clearTimeout(timer);
+        abortListener?.[Symbol.dispose]();
+        session.commands.delete(messageId);
+      }
+      return { boxId, command, payload, acknowledged: true, deviceConfirmed: false };
     } finally {
-      clearTimeout(timer);
-      abortListener?.[Symbol.dispose]();
-      session.commands.delete(messageId);
+      session.controlCount--;
     }
-    return { boxId, command, payload, acknowledged: true, deviceConfirmed: false };
   }
 
   private requireFeature(boxId: string, feature: string): void {
@@ -419,8 +433,7 @@ export class ToniesRealtime extends EventEmitter {
   async skip(boxId: string, offset: -1 | 1) {
     this.requireFeature(boxId, "playbackControls");
     assert(offset === -1 || offset === 1, "Chapter offset must be -1 or 1");
-    const state = await this.controlState(boxId, state => Number.isInteger(state.playback?.chapter));
-    return this.seek(boxId, Math.max(0, state.playback!.chapter! + offset));
+    return this.sendCommand(boxId, "playback", state => ({ action: "setPosition", chapter: Math.max(0, state.playback!.chapter! + offset), ms: 0 }), state => Number.isInteger(state.playback?.chapter));
   }
 
   setVolume(boxId: string, level: number) {
@@ -432,8 +445,7 @@ export class ToniesRealtime extends EventEmitter {
   async changeVolume(boxId: string, offset: -1 | 1) {
     this.requireFeature(boxId, "playbackControls");
     assert(offset === -1 || offset === 1, "Volume offset must be -1 or 1");
-    const state = await this.controlState(boxId, state => Number.isInteger(state.volume?.level));
-    return this.setVolume(boxId, Math.max(0, Math.min(13, state.volume!.level! + offset)));
+    return this.sendCommand(boxId, "volume", state => ({ level: Math.max(0, Math.min(13, state.volume!.level! + offset)) }), state => Number.isInteger(state.volume?.level));
   }
 
   sleepTimer(boxId: string, seconds: number) {

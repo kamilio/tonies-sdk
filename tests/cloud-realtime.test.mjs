@@ -840,6 +840,40 @@ test("broker loss rejects acknowledged commands still awaiting physical confirma
   assert.equal((await next).deviceConfirmed, true);
 });
 
+test("disconnected transports cannot restore stale state or emit playback transitions", async context => {
+  const { live, socket, send } = await fixture();
+  context.after(() => live.disconnect());
+  let snapshots = 0;
+  let starts = 0;
+  live.on("state", () => { snapshots++; });
+  live.on("playback-started", () => { starts++; });
+  socket.connected = false;
+  socket.emit("close");
+  const disconnectedSnapshots = snapshots;
+  send("online-state", { onlineState: "connected" }, true);
+  send("playback/state", { tonie: "OLD", paused: false });
+  send("app-reply/bedtime-state", { stl: { state: "on", duration: 1800 } });
+  assert.deepEqual(live.states.get(box.id), { onlineState: "unknown" });
+  assert.equal(snapshots, disconnectedSnapshots);
+  assert.equal(starts, 0);
+  socket.connected = true;
+  socket.emit("connect");
+  send("online-state", { onlineState: "connected" }, true);
+  send("playback/state", { tonie: "CURRENT", paused: false }, true);
+  assert.equal(live.states.get(box.id).playback.tonie, "CURRENT");
+  assert.equal(starts, 0);
+});
+
+test("retained telemetry arriving during initial subscription is accepted", async context => {
+  const { live, socket } = await fixture({ disconnected: true });
+  context.after(() => live.disconnect());
+  socket.subscribeAsync = async () => {
+    socket.emit("message", "external/toniebox/AABBCCDDEEFF/online-state", Buffer.from('{"onlineState":"connected"}'), { retain: true });
+  };
+  await live.connect([box]);
+  assert.equal(live.states.get(box.id).onlineState, "connected");
+});
+
 test("confirmations cannot execute operations while the broker is disconnected", async context => {
   const { live, socket } = await fixture();
   context.after(() => live.disconnect());
@@ -921,6 +955,83 @@ test("at most 32 commands can occupy the outgoing MQTT store", async () => {
   await live.disconnect();
   assert.equal((await results).filter(result => result.status === "rejected").length, 32);
   assert.equal(socket.removed.length, 32);
+});
+
+test("control admission includes telemetry preparation and releases failed slots", async context => {
+  const { live, socket, send } = await fixture({ disconnected: true });
+  context.after(() => live.disconnect());
+  await live.connect([box]);
+  const controls = Array.from({ length: 32 }, (_, index) => index % 2 ? live.skip(box.id, 1) : live.changeVolume(box.id, 1));
+  const results = Promise.allSettled(controls);
+  const excess = await Promise.race([
+    assert.rejects(live.pause(box.id), /At most 32/).then(() => "rejected"),
+    new Promise(resolve => setImmediate(() => resolve("waiting")))
+  ]);
+  assert.equal(excess, "rejected");
+  assert.equal(socket.published.length, 0);
+  send("online-state", { onlineState: "offline" });
+  assert.equal((await results).filter(result => result.status === "rejected").length, 32);
+  send("online-state", { onlineState: "connected" });
+  assert((await live.pause(box.id)).acknowledged);
+});
+
+test("cached-state control bursts admit only 32 operations before allocating waits", async context => {
+  const { live, socket } = await fixture();
+  context.after(() => live.disconnect());
+  let waits = 0;
+  const waitForState = live.waitForState.bind(live);
+  live.waitForState = (...args) => { waits++; return waitForState(...args); };
+  const controls = Array.from({ length: 1000 }, () => live.pause(box.id));
+  const results = await Promise.allSettled(controls);
+  assert.equal(waits, 32);
+  assert.equal(socket.published.length, 32);
+  assert.equal(results.filter(result => result.status === "fulfilled").length, 32);
+  assert(results.filter(result => result.status === "rejected").every(result => /At most 32/.test(result.reason.message)));
+  assert((await live.pause(box.id)).acknowledged);
+});
+
+test("control admission slots survive failed serialization, publishing, and session replacement", async context => {
+  const { live, socket, send } = await fixture();
+  context.after(() => live.disconnect());
+  const circular = {};
+  circular.circular = circular;
+  for (let index = 0; index < 40; index++) await assert.rejects(live.command(box.id, "volume", circular), /circular/i);
+  const publish = socket.publishAsync;
+  socket.publishAsync = () => { throw new Error("publish failed"); };
+  for (let index = 0; index < 40; index++) await assert.rejects(live.pause(box.id), /publish failed/);
+  socket.publishAsync = publish;
+  const pending = Promise.allSettled(Array.from({ length: 32 }, () => live.changeVolume(box.id, 1)));
+  await live.disconnect();
+  assert.equal((await pending).filter(result => result.status === "rejected").length, 32);
+  await live.connect([box]);
+  send("online-state", { onlineState: "connected" }, true);
+  const next = await Promise.all(Array.from({ length: 32 }, () => live.pause(box.id)));
+  assert(next.every(result => result.acknowledged));
+});
+
+test("a reconnect between cached control preparation and publish cannot replay the command", async context => {
+  const { live, socket, send } = await fixture();
+  context.after(() => live.disconnect());
+  const command = live.pause(box.id);
+  const rejected = assert.rejects(command, /broker disconnected/);
+  socket.connected = false;
+  socket.emit("close");
+  socket.connected = true;
+  socket.emit("connect");
+  send("online-state", { onlineState: "connected" }, true);
+  await rejected;
+  assert.equal(socket.published.length, 0);
+  assert((await live.pause(box.id)).acknowledged);
+});
+
+test("an offline update before cached control publication cancels the command", async context => {
+  const { live, socket, send } = await fixture();
+  context.after(() => live.disconnect());
+  const command = live.pause(box.id);
+  const rejected = assert.rejects(command, /offline/);
+  send("online-state", { onlineState: "offline" });
+  await rejected;
+  assert.equal(socket.published.length, 0);
 });
 
 test("real MQTT transport never replays an expired command after reconnect", { timeout: 5000 }, async context => {
