@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
-import { EventEmitter } from "node:events";
+import { addAbortListener, EventEmitter } from "node:events";
 import { connectAsync, type MqttClient, type IClientOptions, type IPublishPacket } from "mqtt";
 import { TonieCloudClient, tonieboxCapabilities, type Toniebox } from "./cloud.js";
 
@@ -9,6 +10,35 @@ export const TONIES_STATE_TOPICS = [
   "online-state", "metrics/battery", "metrics/headphones", "settings-applied",
   "playback/state", "volume/state", "app-reply/bedtime-state"
 ] as const;
+const controlContext = new AsyncLocalStorage<AbortSignal>();
+const abortSubscriptions = new WeakMap<AbortSignal, { callbacks: Set<(reason: unknown) => void>; dispose: () => void }>();
+
+function followAbortSignals(controller: AbortController, signals: AbortSignal[]): () => void {
+  const disposers: Array<() => void> = [];
+  const dispose = () => { while (disposers.length) disposers.pop()!(); };
+  const notify = (reason: unknown) => { controller.abort(reason); dispose(); };
+  for (const signal of new Set(signals)) {
+    if (signal.aborted) {
+      notify(signal.reason);
+      break;
+    }
+    let subscription = abortSubscriptions.get(signal);
+    if (!subscription) {
+      const callbacks = new Set<(reason: unknown) => void>();
+      const listener = addAbortListener(signal, () => { for (const callback of callbacks) callback(signal.reason); });
+      subscription = { callbacks, dispose: () => listener[Symbol.dispose]() };
+      abortSubscriptions.set(signal, subscription);
+    }
+    const { callbacks, dispose: disposeListener } = subscription;
+    callbacks.add(notify);
+    disposers.push(() => {
+      if (!callbacks.delete(notify) || callbacks.size) return;
+      disposeListener();
+      abortSubscriptions.delete(signal);
+    });
+  }
+  return dispose;
+}
 
 export type PlaybackState = {
   tonie?: string;
@@ -241,11 +271,12 @@ export class ToniesRealtime extends EventEmitter {
     if (!options.fresh && !options.live && predicate(current)) return current;
     assert(this.waiterCount < 256, "At most 256 state confirmations may wait concurrently");
     const controller = new AbortController();
-    const signal = AbortSignal.any([
-      controller.signal, this.session.controller.signal,
+    const disposeSignals = followAbortSignals(controller, [
+      this.session.controller.signal,
       ...options.live ? [this.session.brokerController.signal] : [],
       ...options.signal ? [options.signal] : []
     ]);
+    const signal = controller.signal;
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     let resolveState!: (state: TonieboxState) => void;
     let rejectState!: (error: unknown) => void;
@@ -273,6 +304,7 @@ export class ToniesRealtime extends EventEmitter {
       return await waiting;
     } finally {
       clearTimeout(timer);
+      disposeSignals();
       waiters.delete(waiter);
       if (!waiters.size) this.waiters.delete(boxId);
       if (--this.waiterCount === 0) {
@@ -283,7 +315,7 @@ export class ToniesRealtime extends EventEmitter {
     }
   }
 
-  async withConfirmation<Result extends object>(boxId: string, topic: typeof TONIES_STATE_TOPICS[number], predicate: (state: TonieboxState) => boolean, operation: () => Promise<Result>, timeoutMs = 10000) {
+  async withConfirmation<Result extends object>(boxId: string, topic: typeof TONIES_STATE_TOPICS[number], predicate: (state: TonieboxState) => boolean, operation: (signal: AbortSignal) => Promise<Result>, timeoutMs = 10000) {
     assert(this.session && this.boxes.has(boxId), "Connect to this Toniebox first");
     assert(this.session.brokerOnline && this.connection?.connected, "Tonies realtime broker disconnected; cannot start device confirmation");
     assert(TONIES_STATE_TOPICS.includes(topic), "Confirm against a subscribed state topic");
@@ -291,18 +323,22 @@ export class ToniesRealtime extends EventEmitter {
     const confirmations = this.session.confirmations;
     const key = JSON.stringify([boxId, topic]);
     assert(!confirmations.has(key), "A device confirmation is already pending for this Toniebox topic");
-    confirmations.add(key);
-    const brokerSignal = this.session.brokerController.signal;
     const controller = new AbortController();
-    const confirmed = this.waitForState(boxId, predicate, timeoutMs, { fresh: true, live: true, topic, signal: controller.signal });
+    const parentSignal = controlContext.getStore();
+    const disposeSignals = followAbortSignals(controller, [this.session.brokerController.signal, ...parentSignal ? [parentSignal] : []]);
+    const signal = controller.signal;
+    signal.throwIfAborted();
+    confirmations.add(key);
+    const confirmed = this.waitForState(boxId, predicate, timeoutMs, { fresh: true, live: true, topic, signal });
     try {
       const [result, state] = await Promise.all([Promise.resolve().then(() => {
-        brokerSignal.throwIfAborted();
-        return operation();
+        signal.throwIfAborted();
+        return controlContext.run(signal, operation, signal);
       }), confirmed]);
       return { ...result, state, deviceConfirmed: true as const };
     } finally {
       controller.abort();
+      disposeSignals();
       confirmations.delete(key);
     }
   }
@@ -311,9 +347,11 @@ export class ToniesRealtime extends EventEmitter {
     const box = this.boxes.get(boxId);
     const connection = this.connection;
     const session = this.session;
+    const signal = controlContext.getStore();
     assert(box && connection && session, "Connect to this Toniebox first");
     assert(/^[a-z][a-z0-9-]*$/.test(command), "Invalid control topic");
     await this.controlState(boxId, () => true);
+    signal?.throwIfAborted();
     assert(this.connection === connection && connection.connected && session.brokerOnline, "Tonies realtime broker is disconnected; commands are not queued");
     assert(session.commands.size < 32, "At most 32 Toniebox commands may await acknowledgment");
     const topic = this.topic(box, `app-control/${command}`);
@@ -324,16 +362,20 @@ export class ToniesRealtime extends EventEmitter {
     let cancel!: () => void;
     const interrupted = new Promise<never>((resolve, reject) => {
       cancel = () => {
+        if (!session.commands.delete(messageId)) return;
         reject(new Error("Toniebox command acknowledgment interrupted or timed out; command removed from the outgoing queue"));
         connection.removeOutgoingMessage(messageId);
       };
     });
     session.commands.set(messageId, cancel);
     const timer = setTimeout(cancel, this.options.commandTimeoutMs ?? 10000);
+    const abortListener = signal ? addAbortListener(signal, cancel) : undefined;
+    if (signal?.aborted) cancel();
     try {
       await Promise.race([published, interrupted]);
     } finally {
       clearTimeout(timer);
+      abortListener?.[Symbol.dispose]();
       session.commands.delete(messageId);
     }
     return { boxId, command, payload, acknowledged: true, deviceConfirmed: false };
@@ -346,9 +388,16 @@ export class ToniesRealtime extends EventEmitter {
   private async controlState(boxId: string, predicate: (state: TonieboxState) => boolean): Promise<TonieboxState> {
     const session = this.session;
     assert(session && this.connection?.connected && session.brokerOnline, "Tonies realtime broker is disconnected; commands are not queued");
-    const state = await this.waitForState(boxId, state => state.onlineState !== undefined && (state.onlineState !== "connected" || predicate(state)), 10000, { signal: session.brokerController.signal });
-    assert.equal(state.onlineState, "connected", "Toniebox is offline; cloud wake is not supported");
-    return state;
+    const parentSignal = controlContext.getStore();
+    const controller = new AbortController();
+    const disposeSignals = followAbortSignals(controller, [session.brokerController.signal, ...parentSignal ? [parentSignal] : []]);
+    try {
+      const state = await this.waitForState(boxId, state => state.onlineState !== undefined && (state.onlineState !== "connected" || predicate(state)), 10000, { signal: controller.signal });
+      assert.equal(state.onlineState, "connected", "Toniebox is offline; cloud wake is not supported");
+      return state;
+    } finally {
+      disposeSignals();
+    }
   }
 
   play(boxId: string) {

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { EventEmitter, once } from "node:events";
+import { EventEmitter, getEventListeners, once } from "node:events";
 import { createRequire } from "node:module";
 import { Duplex } from "node:stream";
 import { MqttClient } from "mqtt";
@@ -569,6 +569,131 @@ test("failed or timed-out confirmations release their state listeners", async ()
   await live.disconnect();
 });
 
+test("confirmation timeout cancels commands still waiting for initial telemetry", async context => {
+  const { live, socket, send } = await fixture({ disconnected: true });
+  context.after(() => live.disconnect());
+  await live.connect([box]);
+  await assert.rejects(live.withConfirmation(box.id, "app-reply/bedtime-state", () => true, () => live.sleepTimer(box.id, 1800), 1), { name: "AbortError" });
+  send("online-state", { onlineState: "connected" }, true);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(socket.published.length, 0);
+  assert.equal(live.listenerCount("state"), 0);
+});
+
+test("confirmation timeout removes commands still awaiting broker acknowledgment", async context => {
+  const { live, socket } = await fixture();
+  context.after(() => live.disconnect());
+  socket.publishAsync = (...args) => { socket.published.push(args); return new Promise(() => {}); };
+  await assert.rejects(live.withConfirmation(box.id, "app-reply/bedtime-state", () => true, () => live.sleepTimer(box.id, 1800), 5), { name: "AbortError" });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(socket.removed, [1]);
+});
+
+test("operation abort listeners cannot suppress removal of timed-out commands", async context => {
+  const { live, socket } = await fixture();
+  context.after(() => live.disconnect());
+  socket.publishAsync = (...args) => { socket.published.push(args); return new Promise(() => {}); };
+  await assert.rejects(live.withConfirmation(box.id, "app-reply/bedtime-state", () => true, signal => {
+    signal.addEventListener("abort", event => event.stopImmediatePropagation());
+    return live.sleepTimer(box.id, 1800);
+  }, 5), { name: "AbortError" });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(socket.removed, [1]);
+});
+
+test("late confirmation work cannot publish after timeout or cancel unrelated controls", async context => {
+  const { live, socket } = await fixture();
+  context.after(() => live.disconnect());
+  const ready = deferred();
+  await assert.rejects(live.withConfirmation(box.id, "app-reply/bedtime-state", () => true, async () => {
+    await ready.promise;
+    return live.sleepTimer(box.id, 1800);
+  }, 1), { name: "AbortError" });
+  ready.resolve();
+  await live.pause(box.id);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(socket.published.map(([, payload]) => JSON.parse(payload)), [{ action: "pause" }]);
+});
+
+test("nested confirmations inherit cancellation and expose an operation signal", async context => {
+  const { live, socket } = await fixture();
+  context.after(() => live.disconnect());
+  const ready = deferred();
+  let signal;
+  await assert.rejects(live.withConfirmation(box.id, "app-reply/bedtime-state", () => true, () =>
+    live.withConfirmation(box.id, "volume/state", () => true, async operationSignal => {
+      signal = operationSignal;
+      await ready.promise;
+      return live.setVolume(box.id, 3);
+    }), 5), { name: "AbortError" });
+  assert(signal instanceof AbortSignal);
+  assert(signal.aborted);
+  ready.resolve();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(socket.published.length, 0);
+  assert.equal(live.listenerCount("state"), 0);
+  assert.equal(live.listenerCount("error"), 0);
+});
+
+test("late work from a closed session cannot command a newly connected session", async context => {
+  const { live, socket, send } = await fixture();
+  context.after(() => live.disconnect());
+  const ready = deferred();
+  const rejected = assert.rejects(live.withConfirmation(box.id, "app-reply/bedtime-state", () => true, async () => {
+    await ready.promise;
+    return live.sleepTimer(box.id, 1800);
+  }), { name: "AbortError" });
+  await new Promise(resolve => setImmediate(resolve));
+  await live.disconnect();
+  await rejected;
+  await live.connect([box]);
+  send("online-state", { onlineState: "connected" }, true);
+  ready.resolve();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(socket.published.length, 0);
+});
+
+test("10000 confirmed controls release cancellation scopes and retained heap", async context => {
+  const { live, socket, send } = await fixture();
+  context.after(() => live.disconnect());
+  let messageId = 0;
+  socket.publishAsync = async () => {};
+  socket.getLastMessageId = () => ++messageId;
+  const confirm = () => live.withConfirmation(box.id, "volume/state", state => state.volume?.level === 4, async () => {
+    const result = await live.setVolume(box.id, 4);
+    send("volume/state", { level: 4 });
+    return result;
+  });
+  for (let index = 0; index < 20; index++) await confirm();
+  global.gc?.();
+  const baseline = process.memoryUsage().heapUsed;
+  const started = performance.now();
+  for (let index = 0; index < 10000; index++) await confirm();
+  await new Promise(resolve => setImmediate(resolve));
+  global.gc?.();
+  await new Promise(resolve => setImmediate(resolve));
+  global.gc?.();
+  const retained = process.memoryUsage().heapUsed - baseline;
+  assert.equal(live.listenerCount("state"), 0);
+  assert.equal(live.listenerCount("error"), 0);
+  assert.equal(live.states.size, 1);
+  if (global.gc) assert(retained < 2 * 1024 * 1024, `Confirmed controls retained ${retained} heap bytes`);
+  context.diagnostic(`10000 confirmed controls: ${(performance.now() - started).toFixed(1)} ms; retained heap delta ${retained} bytes${global.gc ? " after GC" : " (GC not forced)"}`);
+});
+
+test("broker loss removes a confirmed command only once", async context => {
+  const { live, socket } = await fixture();
+  context.after(() => live.disconnect());
+  socket.publishAsync = (...args) => { socket.published.push(args); return new Promise(() => {}); };
+  const rejected = assert.rejects(live.withConfirmation(box.id, "app-reply/bedtime-state", () => true, () => live.sleepTimer(box.id, 1800)), /broker disconnected/);
+  await new Promise(resolve => setImmediate(resolve));
+  socket.connected = false;
+  socket.emit("close");
+  await rejected;
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(socket.removed, [1]);
+});
+
 test("already-aborted waiters never accept cached state", async () => {
   const { live } = await fixture();
   const controller = new AbortController();
@@ -590,9 +715,11 @@ test("invalid confirmation targets never execute the operation", async () => {
 
 test("256 concurrent confirmations share listeners and cap pending memory", async () => {
   const { live, send } = await fixture();
-  const waiting = Array.from({ length: 256 }, () => live.waitForState(box.id, state => state.volume?.level === 4, 10000, { fresh: true }));
+  const controller = new AbortController();
+  const waiting = Array.from({ length: 256 }, () => live.waitForState(box.id, state => state.volume?.level === 4, 10000, { fresh: true, signal: controller.signal }));
   assert.equal(live.listenerCount("state"), 1);
   assert.equal(live.listenerCount("error"), 1);
+  assert.equal(getEventListeners(controller.signal, "abort").length, 1);
   await assert.rejects(live.waitForState(box.id, () => false), /At most 256/);
   let operations = 0;
   await assert.rejects(live.withConfirmation(box.id, "volume/state", () => true, async () => { operations++; return {}; }), /At most 256/);
@@ -602,7 +729,26 @@ test("256 concurrent confirmations share listeners and cap pending memory", asyn
   assert.equal((await Promise.all(waiting)).length, 256);
   assert.equal(live.listenerCount("state"), 0);
   assert.equal(live.listenerCount("error"), 0);
+  assert.equal(getEventListeners(controller.signal, "abort").length, 0);
+  const reason = new Error("Cancel all state observers");
+  const cancelled = Array.from({ length: 256 }, () => assert.rejects(live.waitForState(box.id, () => false, 10000, { signal: controller.signal }), error => error === reason));
+  assert.equal(getEventListeners(controller.signal, "abort").length, 1);
+  controller.abort(reason);
+  await Promise.all(cancelled);
+  assert.equal(getEventListeners(controller.signal, "abort").length, 0);
+  assert.equal(live.listenerCount("state"), 0);
   await live.disconnect();
+});
+
+test("state cancellation cannot be suppressed by another abort listener", async context => {
+  const { live } = await fixture();
+  context.after(() => live.disconnect());
+  const controller = new AbortController();
+  controller.signal.addEventListener("abort", event => event.stopImmediatePropagation());
+  const rejected = assert.rejects(live.waitForState(box.id, () => false, 20, { signal: controller.signal }), /caller cancelled/);
+  controller.abort(new Error("caller cancelled"));
+  await rejected;
+  assert.equal(getEventListeners(controller.signal, "abort").length, 1);
 });
 
 test("async subscriber failures propagate through the existing error event", async () => {
@@ -787,6 +933,9 @@ test("real MQTT transport never replays an expired command after reconnect", { t
   await assert.rejects(live.pause(box.id), /timed out/);
   assert.equal(Object.keys(broker.client.outgoing).length, 0);
   assert.equal(broker.published.length, 1);
+  await assert.rejects(live.withConfirmation(box.id, "playback/state", () => false, () => live.pause(box.id), 10), { name: "AbortError" });
+  assert.equal(Object.keys(broker.client.outgoing).length, 0);
+  assert.equal(broker.published.length, 2);
   const reconnecting = once(live, "connected");
   broker.transport.destroy();
   await reconnecting;
@@ -794,7 +943,7 @@ test("real MQTT transport never replays an expired command after reconnect", { t
   broker.acknowledged = true;
   await live.pause(box.id);
   assert.equal(broker.connections, 2);
-  assert.equal(broker.published.length, 2);
+  assert.equal(broker.published.length, 3);
   assert.equal(Object.keys(broker.client.outgoing).length, 0);
 });
 

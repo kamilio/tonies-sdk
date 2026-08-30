@@ -1,6 +1,6 @@
 # Tonies SDK and CLI
 
-Install from this repository with Node 20 or later, run `npm install`, then use `node dist/cli.js --help` (or the installed `tonies` executable).
+Install from this repository with Node 20.5 or later, run `npm install`, then use `node dist/cli.js --help` (or the installed `tonies` executable).
 
 ## Authentication
 
@@ -80,9 +80,11 @@ Use `await cloud.setAuth(repairedAuth)` to adopt credentials from a new login ra
 
 Live device confirmations are scoped to the current broker connection: disconnect rejects an outstanding confirmation even after broker acknowledgment, and reconnect cannot satisfy it with an unrelated later reply. Overlapping confirmed controls for the same box/topic are rejected because device replies have no request correlation IDs; await the previous action before starting another. Ordinary state observation can continue across reconnects.
 
+Realtime commands started inside a confirmation operation inherit its cancellation, including commands delayed by asynchronous work or missing telemetry. Timeout removes pending commands from the outgoing store and prevents later publication; nested confirmations inherit parent cancellation without affecting unrelated controls. The operation callback also receives an `AbortSignal` for your own asynchronous work. Cancellation cannot undo a command already processed by the device.
+
 ## Verification
 
-`npm run test:memory` runs realtime and audio regressions with explicit garbage collection, including 100 real MQTT connection lifecycles against an in-memory broker, a retained-heap bound, 128 MiB upload/hash fixtures, bounded reader concurrency, and failure drainage.
+`npm run test:memory` runs realtime and audio regressions with explicit garbage collection, including 100 real MQTT connection lifecycles against an in-memory broker, 10,000 confirmed controls, retained-heap bounds, 128 MiB upload/hash fixtures, bounded reader concurrency, and failure drainage.
 
 `TONIES_LIVE_SOAK=1 node --test --test-name-pattern='read-only idle' tests/real-box.test.mjs` runs a seven-minute, read-only MQTT token-expiry soak using your existing account credentials. Boxes may remain offline; the test sends no device commands or REST state polls after connecting, and verifies credential renewal plus usable state after reconnect. It refreshes/persists authentication, so do not run multiple live auth processes against the same stored refresh token concurrently.
 
