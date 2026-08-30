@@ -329,9 +329,13 @@ export class ToniesRealtime extends EventEmitter {
     }
   }
 
+  withConnection<Result>(operation: (signal: AbortSignal) => Promise<Result>): Promise<Result> {
+    assert(this.session?.brokerOnline && this.connection?.connected, "Tonies realtime broker disconnected; cannot start device confirmation or control scope");
+    return this.withCancellation(this.session.brokerController.signal, operation);
+  }
+
   async withConfirmation<Result extends object>(boxId: string, topic: typeof TONIES_STATE_TOPICS[number], predicate: (state: TonieboxState) => boolean, operation: (signal: AbortSignal) => Promise<Result>, timeoutMs = 10000) {
     assert(this.session && this.boxes.has(boxId), "Connect to this Toniebox first");
-    assert(this.session.brokerOnline && this.connection?.connected, "Tonies realtime broker disconnected; cannot start device confirmation");
     assert(TONIES_STATE_TOPICS.includes(topic), "Confirm against a subscribed state topic");
     assert(this.waiterCount < 256, "At most 256 state confirmations may wait concurrently");
     const confirmations = this.session.confirmations;
@@ -339,7 +343,7 @@ export class ToniesRealtime extends EventEmitter {
     assert(!confirmations.has(key), "A device confirmation is already pending for this Toniebox topic");
     confirmations.add(key);
     try {
-      return await this.withCancellation(this.session.brokerController.signal, async signal => {
+      return await this.withConnection(async signal => {
         const confirmed = this.waitForState(boxId, predicate, timeoutMs, { fresh: true, live: true, topic, signal });
         const [result, state] = await Promise.all([Promise.resolve().then(() => {
           signal.throwIfAborted();

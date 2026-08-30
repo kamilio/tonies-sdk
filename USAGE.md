@@ -88,6 +88,8 @@ Realtime commands started inside a confirmation operation inherit its cancellati
 
 For a device lifecycle or caller-owned cancellation scope, use `realtime.withCancellation(signal, operation)`. SDK controls and nested confirmations inside the callback inherit that signal without closing the shared MQTT connection; unrelated devices remain usable. The scope also expires when the callback settles, preventing asynchronous work left behind by the callback from publishing later. Custom asynchronous work must honor the callback's supplied signal, and callers should drain their pending operations before releasing the shared account.
 
+`realtime.withConnection(operation)` additionally binds work to the current connected broker session, including any parent cancellation scope. A broker disconnect invalidates the whole operation even if MQTT reconnects before delayed work resumes; it cannot publish commands against the replacement connection. This is useful when serializing multi-step controls that first wait for telemetry.
+
 ## Verification
 
 `npm run test:memory` runs realtime and audio regressions with explicit garbage collection, including 100 real MQTT connection lifecycles against an in-memory broker, 10,000 confirmed controls, retained-heap bounds, 128 MiB upload/hash fixtures, bounded reader concurrency, and failure drainage.

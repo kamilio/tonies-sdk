@@ -689,6 +689,26 @@ test("caller cancellation scopes stop telemetry waits without closing the shared
   assert((await live.pause(box.id)).acknowledged);
 });
 
+test("connection scopes cannot publish delayed work across a broker reconnect", async context => {
+  const { live, socket, send } = await fixture();
+  context.after(() => live.disconnect());
+  const blocked = deferred();
+  const pending = live.withConnection(async () => { await blocked.promise; return live.pause(box.id); });
+  const rejected = assert.rejects(pending, /broker disconnected/);
+  socket.connected = false;
+  socket.emit("close");
+  let invoked = false;
+  assert.throws(() => live.withConnection(async () => { invoked = true; }), /broker disconnected/);
+  assert.equal(invoked, false);
+  socket.connected = true;
+  socket.emit("connect");
+  send("online-state", { onlineState: "connected" }, true);
+  blocked.resolve();
+  await rejected;
+  assert.equal(socket.published.length, 0);
+  assert((await live.withConnection(() => live.pause(box.id))).acknowledged);
+});
+
 test("cancellation scopes compose, expire after success, and reject aborted callers", async context => {
   const { live, socket } = await fixture();
   context.after(() => live.disconnect());
