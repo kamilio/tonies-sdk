@@ -74,7 +74,7 @@ function restCommand<const Name extends string, const Shape extends Record<strin
       const values = params as Record<string, unknown>;
       const resolved = path.replace(/\{([^}]+)\}/g, (_, key: string) => encodeURIComponent(String(values[key])));
       const body = Object.fromEntries(Object.entries(values).filter(([key, value]) => !positional.includes(key) && value !== undefined));
-      return cloud.request(method, resolved, Object.keys(body).length ? body : undefined);
+      return cloud.request(method, resolved, ["POST", "PUT", "PATCH"].includes(method) ? body : undefined);
     }
   });
 }

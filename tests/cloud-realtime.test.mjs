@@ -153,3 +153,35 @@ test("playback state distinguishes stopped/download/blocked and estimates positi
   assert.equal(playbackPosition({ chapterDuration: 100, chapterUntilMs: 90000 }, 10000), 20);
   assert.equal(playbackPosition({}), undefined);
 });
+
+test("empty retained-topic updates clear playback and offline snapshots do not keep playing state", async () => {
+  const { live, socket, send } = await fixture();
+  send("playback/state", { tonie: "TONIE", chapter: 0, paused: false }, true);
+  socket.emit("message", "external/toniebox/AABBCCDDEEFF/playback/state", Buffer.alloc(0), { retain: false });
+  assert.deepEqual(live.states.get(box.id).playback, {});
+  send("playback/state", { tonie: "TONIE", chapter: 0, paused: false });
+  send("online-state", { onlineState: "offline" });
+  assert.equal(live.states.get(box.id).playback, undefined);
+  await live.disconnect();
+});
+
+test("Toolcraft management commands preserve typed settings and required empty write bodies", async context => {
+  const previousFetch = globalThis.fetch;
+  const previousToken = process.env.TONIES_ACCESS_TOKEN;
+  const calls = [];
+  process.env.TONIES_ACCESS_TOKEN = jwt();
+  globalThis.fetch = async (url, init) => { calls.push({ url, ...init }); return response({ ok: true }); };
+  context.after(() => {
+    globalThis.fetch = previousFetch;
+    if (previousToken === undefined) delete process.env.TONIES_ACCESS_TOKEN;
+    else process.env.TONIES_ACCESS_TOKEN = previousToken;
+  });
+  const { createToniesSDK } = await import("../dist/index.js");
+  const sdk = createToniesSDK();
+  await sdk.tonieboxes.settings({ householdId: "house/hold", tonieboxId: "BOX", maxVolume: 50, skippingEnabled: false, lightringBrightness: 0 });
+  assert(calls[0].url.endsWith("/households/house%2Fhold/tonieboxes/BOX"));
+  assert.deepEqual(JSON.parse(calls[0].body), { maxVolume: 50, skippingEnabled: false, lightringBrightness: 0 });
+  await sdk.tunes.assign({ householdId: "household", tonieId: "tonie", tuneId: "tune" });
+  assert.equal(calls[1].body, "{}");
+  assert.equal(calls[1].method, "PUT");
+});

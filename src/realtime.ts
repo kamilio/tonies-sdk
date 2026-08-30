@@ -104,12 +104,15 @@ export class ToniesRealtime extends EventEmitter {
 
   receive(topic: string, bytes: Buffer, packet: Pick<IPublishPacket, "retain">): void {
     const box = [...this.boxes.values()].find(box => topic.startsWith(this.topic(box, "")));
-    if (!box || !bytes.length) return;
+    if (!box) return;
     const suffix = topic.slice(this.topic(box, "").length);
-    const payload = JSON.parse(bytes.toString()) as Record<string, unknown>;
+    const payload = (bytes.length ? JSON.parse(bytes.toString()) : {}) as Record<string, unknown>;
     const previous = this.states.get(box.id) ?? {};
     const state = { ...previous };
-    if (suffix === "online-state") state.onlineState = payload.onlineState as string;
+    if (suffix === "online-state") {
+      state.onlineState = payload.onlineState as string;
+      if (state.onlineState !== "connected") state.playback = undefined;
+    }
     if (suffix === "metrics/battery") state.battery = payload;
     if (suffix === "metrics/headphones") state.headphones = payload;
     if (suffix === "settings-applied") state.settingsApplied = true;
