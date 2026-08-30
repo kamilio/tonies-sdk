@@ -151,6 +151,7 @@ export class ToniesRealtime extends EventEmitter {
     assert(/^[a-z][a-z0-9-]*$/.test(command), "Invalid control topic");
     const state = await this.waitForState(boxId, state => state.onlineState !== undefined);
     assert.equal(state.onlineState, "connected", "Toniebox is offline; cloud wake is not supported");
+    assert(this.connection.connected, "Tonies realtime broker is disconnected; commands are not queued");
     const topic = this.topic(box, `app-control/${command}`);
     await this.connection.publishAsync(topic, JSON.stringify(payload), {
       qos: 1, retain: false, properties: { messageExpiryInterval: 10 }

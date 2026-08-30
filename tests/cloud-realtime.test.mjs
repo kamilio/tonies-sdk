@@ -16,6 +16,7 @@ async function fixture(options = {}) {
   } });
   const socket = new EventEmitter();
   socket.options = {};
+  socket.connected = true;
   socket.published = [];
   socket.subscribeAsync = async (topics, settings) => { socket.subscriptions = { topics, settings }; };
   socket.publishAsync = async (...args) => { socket.published.push(args); };
@@ -126,6 +127,14 @@ test("offline and unsupported boxes cannot receive controls", async () => {
   const unsupported = await fixture({ box: { ...box, features: [] } });
   assert.throws(() => unsupported.live.pause(box.id), /playbackControls/);
   await unsupported.live.disconnect();
+});
+
+test("commands are not queued while the broker is disconnected", async () => {
+  const { socket, live } = await fixture();
+  socket.connected = false;
+  await assert.rejects(live.pause(box.id), /not queued/);
+  assert.equal(socket.published.length, 0);
+  await live.disconnect();
 });
 
 test("retained snapshots and duplicate playback events never trigger false starts", async () => {
