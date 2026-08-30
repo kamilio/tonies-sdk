@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { EventEmitter, once } from "node:events";
+import { EventEmitter } from "node:events";
 import { connectAsync, type MqttClient, type IClientOptions, type IPublishPacket } from "mqtt";
 import { TonieCloudClient, tonieboxCapabilities, type Toniebox } from "./cloud.js";
 
@@ -53,6 +53,8 @@ type RealtimeSession = {
   ending?: Promise<void>;
 };
 
+type StateWaiter = { notify: (event: TonieboxEvent) => void; reject: (error: unknown) => void };
+
 export function isPlaying(playback?: PlaybackState): boolean {
   return Boolean(playback?.tonie && playback.paused === false && !playback.ended && !playback.blocked && !playback.downloading);
 }
@@ -71,6 +73,14 @@ export class ToniesRealtime extends EventEmitter {
   private session?: RealtimeSession;
   private boxes = new Map<string, Toniebox>();
   private routes = new Map<string, { boxId: string; suffix: string }>();
+  private waiters = new Map<string, Set<StateWaiter>>();
+  private waiterCount = 0;
+  private readonly stateWaitListener = async (event: TonieboxEvent) => {
+    for (const waiter of this.waiters.get(event.boxId) ?? []) waiter.notify(event);
+  };
+  private readonly errorWaitListener = (error: unknown) => {
+    for (const waiters of this.waiters.values()) for (const waiter of waiters) waiter.reject(error);
+  };
 
   constructor(readonly cloud: TonieCloudClient, private readonly options: {
     connect?: (url: string, options: IClientOptions) => Promise<MqttClient>;
@@ -195,16 +205,67 @@ export class ToniesRealtime extends EventEmitter {
     if (suffix === "online-state" && state.onlineState !== previous.onlineState) this.emit("online-changed", event);
   }
 
-  async waitForState(boxId: string, predicate: (state: TonieboxState) => boolean, timeoutMs = 10000): Promise<TonieboxState> {
+  async waitForState(boxId: string, predicate: (state: TonieboxState) => boolean, timeoutMs = 10000, options: {
+    fresh?: boolean;
+    live?: boolean;
+    topic?: typeof TONIES_STATE_TOPICS[number];
+    signal?: AbortSignal;
+  } = {}): Promise<TonieboxState> {
     assert(this.session && this.boxes.has(boxId), "Connect to this Toniebox first");
+    options.signal?.throwIfAborted();
+    const current = this.states.get(boxId) ?? {};
+    if (!options.fresh && !options.live && predicate(current)) return current;
+    assert(this.waiterCount < 256, "At most 256 state confirmations may wait concurrently");
     const controller = new AbortController();
-    const signal = AbortSignal.any([controller.signal, this.session.controller.signal]);
+    const signal = AbortSignal.any([controller.signal, this.session.controller.signal, ...options.signal ? [options.signal] : []]);
     const timer = setTimeout(() => controller.abort(), timeoutMs);
+    let resolveState!: (state: TonieboxState) => void;
+    let rejectState!: (error: unknown) => void;
+    let settled = false;
+    const waiting = new Promise<TonieboxState>((resolve, reject) => { resolveState = resolve; rejectState = reject; });
+    const notify = (event: TonieboxEvent) => {
+      if (settled || event.boxId !== boxId || (options.topic && event.topic !== options.topic) || (options.live && event.retained)) return;
+      settled = true;
+      if (predicate(event.state)) resolveState(event.state);
+      else settled = false;
+    };
+    const errorListener = (error: unknown) => { settled = true; rejectState(error); };
+    const abort = () => errorListener(signal.reason);
+    const waiter = { notify, reject: errorListener };
+    const waiters = this.waiters.get(boxId) ?? new Set<StateWaiter>();
+    this.waiters.set(boxId, waiters);
+    waiters.add(waiter);
+    if (this.waiterCount++ === 0) {
+      this.on("state", this.stateWaitListener);
+      this.on("error", this.errorWaitListener);
+    }
+    signal.addEventListener("abort", abort, { once: true });
+    if (signal.aborted) abort();
     try {
-      while (!predicate(this.states.get(boxId) ?? {})) await once(this, "state", { signal });
-      return this.states.get(boxId)!;
+      return await waiting;
     } finally {
       clearTimeout(timer);
+      waiters.delete(waiter);
+      if (!waiters.size) this.waiters.delete(boxId);
+      if (--this.waiterCount === 0) {
+        this.off("state", this.stateWaitListener);
+        this.off("error", this.errorWaitListener);
+      }
+      signal.removeEventListener("abort", abort);
+    }
+  }
+
+  async withConfirmation<Result extends object>(boxId: string, topic: typeof TONIES_STATE_TOPICS[number], predicate: (state: TonieboxState) => boolean, operation: () => Promise<Result>, timeoutMs = 10000) {
+    assert(this.session && this.boxes.has(boxId), "Connect to this Toniebox first");
+    assert(TONIES_STATE_TOPICS.includes(topic), "Confirm against a subscribed state topic");
+    assert(this.waiterCount < 256, "At most 256 state confirmations may wait concurrently");
+    const controller = new AbortController();
+    const confirmed = this.waitForState(boxId, predicate, timeoutMs, { fresh: true, live: true, topic, signal: controller.signal });
+    try {
+      const [result, state] = await Promise.all([Promise.resolve().then(operation), confirmed]);
+      return { ...result, state, deviceConfirmed: true as const };
+    } finally {
+      controller.abort();
     }
   }
 

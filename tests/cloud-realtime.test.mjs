@@ -174,6 +174,40 @@ test("a password login supersedes old refreshes and prevents redirecting credent
   assert.equal(requests, 2);
 });
 
+test("credential persistence serializes writes and coalesces superseded credentials", async () => {
+  const started = deferred();
+  const blocked = deferred();
+  const saved = [];
+  const emitted = [];
+  let active = 0;
+  let maximum = 0;
+  const cloud = new TonieCloudClient({ onAuth: async auth => {
+    active++;
+    maximum = Math.max(maximum, active);
+    if (auth.accessToken === "first") { started.resolve(); await blocked.promise; }
+    saved.push(auth.accessToken);
+    active--;
+  } });
+  cloud.on("auth", auth => emitted.push(auth.accessToken));
+  const first = cloud.setAuth({ accessToken: "first" });
+  await started.promise;
+  const middle = cloud.setAuth({ accessToken: "middle" });
+  const latest = cloud.setAuth({ accessToken: "latest" });
+  blocked.resolve();
+  const results = await Promise.all([first, middle, latest]);
+  assert.equal(maximum, 1);
+  assert.deepEqual(saved, ["first", "latest"]);
+  assert.deepEqual(emitted, ["latest"]);
+  assert(results.every(auth => auth.accessToken === "latest"));
+  assert.equal(first, latest);
+});
+
+test("failed credential persistence does not poison subsequent saves", async () => {
+  const cloud = new TonieCloudClient({ onAuth: auth => { assert.notEqual(auth.accessToken, "failed"); } });
+  await assert.rejects(cloud.setAuth({ accessToken: "failed" }));
+  assert.equal((await cloud.setAuth({ accessToken: "repaired" })).accessToken, "repaired");
+});
+
 test("SDK surfaces HTTP and GraphQL failures rather than false success", async () => {
   const auth = { accessToken: jwt() };
   await assert.rejects(new TonieCloudClient({ auth, fetch: async () => new Response(null, { status: 403 }) }).request("GET", "/me"), /403/);
@@ -314,6 +348,111 @@ test("disconnect and timeouts release state waiters and timers", async () => {
   assert.equal(live.listenerCount("error"), 0);
   assert.equal(socket.listenerCount("message"), 0);
   assert.equal(cloud.listenerCount("auth"), 0);
+});
+
+test("fresh confirmations ignore cached, retained, and unrelated state", async () => {
+  const { live, send } = await fixture();
+  send("app-reply/bedtime-state", { stl: { state: "on" } }, true);
+  let completed = false;
+  const waiting = live.withConfirmation(box.id, "app-reply/bedtime-state", state => state.bedtime?.stl?.state === "on", () => live.sleepTimer(box.id, 1800));
+  waiting.then(() => { completed = true; });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(completed, false);
+  send("volume/state", { level: 7 });
+  send("app-reply/bedtime-state", { stl: { state: "on" } }, true);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(completed, false);
+  send("app-reply/bedtime-state", { stl: { state: "on" } });
+  const result = await waiting;
+  assert.equal(result.deviceConfirmed, true);
+  assert.equal(result.acknowledged, true);
+  assert.equal(live.listenerCount("state"), 0);
+  await live.disconnect();
+});
+
+test("device replies arriving before broker acknowledgment still confirm commands", async () => {
+  const { live, send } = await fixture();
+  const result = await live.withConfirmation(box.id, "app-reply/bedtime-state", state => state.bedtime?.stl?.state === "on", async () => {
+    send("app-reply/bedtime-state", { stl: { state: "on" } });
+    await new Promise(resolve => setImmediate(resolve));
+    return { acknowledged: true };
+  });
+  assert.equal(result.deviceConfirmed, true);
+  assert.equal(result.state.bedtime.stl.state, "on");
+  await live.disconnect();
+});
+
+test("a synchronous telemetry burst cannot lose a matching fresh reply", async () => {
+  const { live, send } = await fixture();
+  const waiting = live.withConfirmation(box.id, "app-reply/bedtime-state", state => state.bedtime?.stl?.state === "on", async () => {
+    send("volume/state", { level: 3 });
+    send("app-reply/bedtime-state", { stl: { state: "on" } }, true);
+    send("app-reply/bedtime-state", { stl: { state: "on" } });
+    send("volume/state", { level: 4 });
+    return { acknowledged: true };
+  });
+  assert.equal((await waiting).deviceConfirmed, true);
+  await live.disconnect();
+});
+
+test("a failing state predicate rejects and releases its persistent listener", async () => {
+  const { live, send } = await fixture();
+  const waiting = live.waitForState(box.id, () => { throw new Error("invalid predicate"); }, 10000, { fresh: true });
+  const rejected = assert.rejects(waiting, /invalid predicate/);
+  send("volume/state", { level: 3 });
+  send("volume/state", { level: 4 });
+  send("volume/state", { level: 5 });
+  await rejected;
+  assert.equal(live.listenerCount("state"), 0);
+  assert.equal(live.listenerCount("error"), 0);
+  await live.disconnect();
+});
+
+test("failed or timed-out confirmations release their state listeners", async () => {
+  const { live } = await fixture();
+  await assert.rejects(live.withConfirmation(box.id, "app-reply/bedtime-state", () => true, () => { throw new Error("publish failed"); }), /publish failed/);
+  assert.equal(live.listenerCount("state"), 0);
+  assert.equal(live.listenerCount("error"), 0);
+  await assert.rejects(live.withConfirmation(box.id, "app-reply/bedtime-state", () => true, async () => ({ acknowledged: true }), 1), { name: "AbortError" });
+  assert.equal(live.listenerCount("state"), 0);
+  assert.equal(live.listenerCount("error"), 0);
+  await live.disconnect();
+});
+
+test("already-aborted waiters never accept cached state", async () => {
+  const { live } = await fixture();
+  const controller = new AbortController();
+  controller.abort();
+  await assert.rejects(live.waitForState(box.id, () => true, 10000, { signal: controller.signal }), { name: "AbortError" });
+  assert.equal(live.listenerCount("state"), 0);
+  await live.disconnect();
+});
+
+test("invalid confirmation targets never execute the operation", async () => {
+  const { live } = await fixture();
+  let calls = 0;
+  const operation = async () => { calls++; return {}; };
+  await assert.rejects(live.withConfirmation("unknown", "volume/state", () => true, operation), /Connect/);
+  await assert.rejects(live.withConfirmation(box.id, "unknown", () => true, operation), /subscribed/);
+  assert.equal(calls, 0);
+  await live.disconnect();
+});
+
+test("256 concurrent confirmations share listeners and cap pending memory", async () => {
+  const { live, send } = await fixture();
+  const waiting = Array.from({ length: 256 }, () => live.waitForState(box.id, state => state.volume?.level === 4, 10000, { fresh: true }));
+  assert.equal(live.listenerCount("state"), 1);
+  assert.equal(live.listenerCount("error"), 1);
+  await assert.rejects(live.waitForState(box.id, () => false), /At most 256/);
+  let operations = 0;
+  await assert.rejects(live.withConfirmation(box.id, "volume/state", () => true, async () => { operations++; return {}; }), /At most 256/);
+  assert.equal(operations, 0);
+  send("volume/state", { level: 3 });
+  send("volume/state", { level: 4 });
+  assert.equal((await Promise.all(waiting)).length, 256);
+  assert.equal(live.listenerCount("state"), 0);
+  assert.equal(live.listenerCount("error"), 0);
+  await live.disconnect();
 });
 
 test("async subscriber failures propagate through the existing error event", async () => {

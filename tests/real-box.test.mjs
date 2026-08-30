@@ -19,17 +19,13 @@ test("real Toniebox 2 confirms night mode and volume and restores original state
     await realtime.connect([box]);
     context.diagnostic(`Waiting for ${box.id} to be awake with its night timer off`);
     original = await realtime.waitForState(box.id, state => state.onlineState === "connected" && state.bedtime?.stl?.state === "off" && Number.isInteger(state.volume?.level), 120000);
-    await realtime.sleepTimer(box.id, 1800);
-    await realtime.waitForState(box.id, state => state.bedtime?.stl?.state === "on");
+    await realtime.withConfirmation(box.id, "app-reply/bedtime-state", state => state.bedtime?.stl?.state === "on", () => realtime.sleepTimer(box.id, 1800));
     context.diagnostic("Native night-mode timer confirmed ON by the device");
-    await realtime.sleepTimer(box.id, 0);
-    await realtime.waitForState(box.id, state => state.bedtime?.stl?.state === "off");
+    await realtime.withConfirmation(box.id, "app-reply/bedtime-state", state => state.bedtime?.stl?.state === "off", () => realtime.sleepTimer(box.id, 0));
     context.diagnostic("Native night-mode timer confirmed OFF by the device");
-    const lower = Math.max(0, original.volume.level - 1);
-    await realtime.setVolume(box.id, lower);
-    await realtime.waitForState(box.id, state => state.volume?.level === lower);
-    await realtime.setVolume(box.id, original.volume.level);
-    await realtime.waitForState(box.id, state => state.volume?.level === original.volume.level);
+    const changed = original.volume.level > 0 ? original.volume.level - 1 : 1;
+    await realtime.withConfirmation(box.id, "volume/state", state => state.volume?.level === changed, () => realtime.setVolume(box.id, changed));
+    await realtime.withConfirmation(box.id, "volume/state", state => state.volume?.level === original.volume.level, () => realtime.setVolume(box.id, original.volume.level));
     context.diagnostic("Live volume confirmed and restored");
   } finally {
     clearInterval(refresh);

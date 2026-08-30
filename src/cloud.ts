@@ -70,6 +70,11 @@ export type ToniesOpenApi = {
   definitions: Record<string, unknown>;
 };
 
+type AuthWriter = {
+  next?: { auth: ToniesAuth; revision: number };
+  promise: Promise<ToniesAuth>;
+};
+
 export function toniesPath(...segments: string[]): string {
   return `/${segments.map(encodeURIComponent).join("/")}`;
 }
@@ -99,6 +104,7 @@ export class TonieCloudClient extends EventEmitter {
   private loggingIn?: Promise<ToniesAuth>;
   private providerAuth?: Promise<ToniesAuth>;
   private authRevision = 0;
+  private writingAuth?: AuthWriter;
 
   constructor(private readonly options: {
     auth?: ToniesAuth;
@@ -112,7 +118,7 @@ export class TonieCloudClient extends EventEmitter {
     this.fetcher = options.fetch ?? globalThis.fetch;
   }
 
-  async setAuth(auth: ToniesAuth): Promise<ToniesAuth> {
+  setAuth(auth: ToniesAuth): Promise<ToniesAuth> {
     const revision = ++this.authRevision;
     this.refreshing = undefined;
     this.loggingIn = undefined;
@@ -120,11 +126,29 @@ export class TonieCloudClient extends EventEmitter {
     return this.saveAuth(auth, revision);
   }
 
-  private async saveAuth(auth: ToniesAuth, revision: number): Promise<ToniesAuth> {
+  private saveAuth(auth: ToniesAuth, revision: number): Promise<ToniesAuth> {
     this.auth = auth;
-    await this.options.onAuth?.(auth);
-    if (revision === this.authRevision) this.emit("auth", auth);
-    return this.auth;
+    if (this.writingAuth) {
+      this.writingAuth.next = { auth, revision };
+      return this.writingAuth.promise;
+    }
+    const writer: AuthWriter = { next: { auth, revision }, promise: Promise.resolve().then(() => this.persistAuth(writer)) };
+    this.writingAuth = writer;
+    return writer.promise;
+  }
+
+  private async persistAuth(writer: AuthWriter): Promise<ToniesAuth> {
+    try {
+      while (writer.next) {
+        const { auth, revision } = writer.next;
+        writer.next = undefined;
+        await this.options.onAuth?.(auth);
+        if (revision === this.authRevision && this.auth === auth) this.emit("auth", auth);
+      }
+      return this.auth;
+    } finally {
+      if (this.writingAuth === writer) this.writingAuth = undefined;
+    }
   }
 
   private async token(body: URLSearchParams, revision: number): Promise<ToniesAuth> {
