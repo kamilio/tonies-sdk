@@ -528,6 +528,28 @@ test("uploads reject source modification before the file-backed body is read", a
   await assert.rejects(uploadFile(audioPath, "Story", 1), { name: "NotReadableError" });
 });
 
+test("audio uploads release response streams after both acceptance and rejection", async context => {
+  const { root, audioPath } = await identityFixture(context, []);
+  context.after(() => rm(root, { recursive: true, force: true }));
+  const fetch = globalThis.fetch;
+  let status = 200;
+  let cancelled = 0;
+  context.mock.method(globalThis, "fetch", async (url, options) => {
+    if (new URL(url).pathname !== "/audio") return fetch(url, options);
+    assert.equal(options.redirect, "error");
+    return new Response(new ReadableStream({
+      start(controller) { controller.enqueue(Buffer.from("response")); },
+      pull(controller) { controller.close(); },
+      cancel() { cancelled++; }
+    }), { status });
+  });
+  assert.equal((await uploadFile(audioPath, "Story", 1)).title, "Story");
+  assert.equal(cancelled, 1);
+  status = 503;
+  await assert.rejects(uploadFile(audioPath, "Story", 1), /503/);
+  assert.equal(cancelled, 2);
+});
+
 test("invalid local uploads fail before reserving remote files", async context => {
   const { root, cloud, audioPath } = await identityFixture(context, []);
   context.after(() => rm(root, { recursive: true, force: true }));

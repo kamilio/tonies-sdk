@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { ClassicLevel } from "classic-level";
-import { DEFAULT_PROFILE_PATH, DEFAULT_STORAGE_PATH, isExpired, readProfileAuth, readStorageAuth, resolveAuth, writeStorageAuth } from "../dist/client.js";
+import { DEFAULT_PROFILE_PATH, DEFAULT_STORAGE_PATH, apiRequest, isExpired, loginWithPassword, readProfileAuth, readStorageAuth, refreshToken, resolveAuth, writeStorageAuth } from "../dist/client.js";
 
 function jwt(exp) {
   return [
@@ -12,6 +12,14 @@ function jwt(exp) {
     Buffer.from(JSON.stringify({ exp })).toString("base64url"),
     "signature"
   ].join(".");
+}
+
+function streamingResponse(status, cancel) {
+  return new Response(new ReadableStream({
+    start(controller) { controller.enqueue(Buffer.from("unavailable")); },
+    pull(controller) { controller.close(); },
+    cancel
+  }), { status });
 }
 
 test("storage auth roundtrips Playwright localStorage fields", async (t) => {
@@ -71,6 +79,50 @@ test("token expiry uses the five second renewal window", () => {
   const now = Math.floor(Date.now() / 1000);
   assert.equal(isExpired(jwt(now + 4)), true);
   assert.equal(isExpired(jwt(now + 30)), false);
+});
+
+test("legacy REST and token failures cancel response bodies and bound nonredirecting requests", async context => {
+  const previousToken = process.env.TONIES_ACCESS_TOKEN;
+  context.after(() => {
+    if (previousToken === undefined) delete process.env.TONIES_ACCESS_TOKEN;
+    else process.env.TONIES_ACCESS_TOKEN = previousToken;
+  });
+  process.env.TONIES_ACCESS_TOKEN = jwt(Math.floor(Date.now() / 1000) + 3600);
+  const requests = [];
+  let cancelled = 0;
+  context.mock.method(globalThis, "fetch", async (url, options) => {
+    requests.push(options);
+    return streamingResponse(503, () => { cancelled++; });
+  });
+  await assert.rejects(apiRequest("GET", "/me"), /503/);
+  await assert.rejects(loginWithPassword({ email: "test", password: "test" }), /503/);
+  await assert.rejects(refreshToken("refresh"), /503/);
+  assert.equal(cancelled, 3);
+  assert(requests.every(request => request.signal instanceof AbortSignal && !request.signal.aborted && request.redirect === "error"));
+});
+
+test("legacy unauthorized retries release both failed bodies and persist the rotated token", async context => {
+  const directory = await mkdtemp(join(tmpdir(), "tonies-sdk-http-auth-"));
+  const previousCwd = process.cwd();
+  const previousEnv = { ...process.env };
+  context.after(async () => {
+    process.chdir(previousCwd);
+    process.env = previousEnv;
+    await rm(directory, { recursive: true, force: true });
+  });
+  process.chdir(directory);
+  process.env.TONIES_ACCESS_TOKEN = jwt(Math.floor(Date.now() / 1000) + 3600);
+  process.env.TONIES_REFRESH_TOKEN = "old-refresh";
+  let requests = 0;
+  let cancelled = 0;
+  context.mock.method(globalThis, "fetch", async url => {
+    if (url.includes("openid-connect")) return Response.json({ access_token: jwt(Math.floor(Date.now() / 1000) + 3600), refresh_token: "rotated" });
+    return streamingResponse(++requests === 1 ? 401 : 503, () => { cancelled++; });
+  });
+  await assert.rejects(apiRequest("GET", "/me"), /503/);
+  assert.equal(requests, 2);
+  assert.equal(cancelled, 2);
+  assert.equal((await readStorageAuth()).refreshToken, "rotated");
 });
 
 test("profile auth reads Chrome localStorage LevelDB records", async (t) => {

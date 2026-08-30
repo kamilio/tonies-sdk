@@ -12,6 +12,8 @@ Before discarding a cloud client, stop its realtime connection and other request
 
 Failed HTTP response streams are canceled before status errors are surfaced, including the final failed response after a token-refresh retry; error bodies are not downloaded into memory.
 
+The desktop management and authentication paths also use 15-second request deadlines and reject redirects. Uploads reject redirects and release their response streams on success or failure; their file-backed transfer is not subject to the short metadata-request deadline.
+
 ## Management
 
 ```
@@ -99,6 +101,8 @@ When a box goes offline, its playback, volume, bedtime, and headphone snapshots 
 ## Verification
 
 `npm run test:memory` runs realtime and audio regressions with explicit garbage collection, including 100 real MQTT connection lifecycles against an in-memory broker, 10,000 confirmed controls, retained-heap bounds, 128 MiB upload/hash fixtures, bounded reader concurrency, and failure drainage.
+
+Set `TONIES_CONTROL_SOAK_ITERATIONS` from 1 to 1000000 to scale the confirmed-control memory benchmark; the default is 10000. This benchmark uses simulated device replies, not physical controls, and keeps the same retained-heap limit at higher iteration counts.
 
 `TONIES_LIVE_SOAK=1 node --test --test-name-pattern='read-only idle' tests/real-box.test.mjs` runs a seven-minute, read-only MQTT token-expiry soak using your existing account credentials. Set `TONIES_LIVE_SOAK_SECONDS` to an integer from 420 to 86400 for a longer run; `TONIES_LIVE_SOAK=1 TONIES_LIVE_SOAK_SECONDS=1800 node --expose-gc tests/real-box.test.mjs` also samples post-GC heap during a thirty-minute run. Boxes may remain offline; the test sends no device commands or REST state polls after connecting, and verifies credential renewal, bounded state/listener counts, plus usable state after reconnect. It refreshes/persists authentication, so do not run multiple live auth processes against the same stored refresh token concurrently.
 

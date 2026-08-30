@@ -8,6 +8,7 @@ import { promisify } from "node:util";
 import { ClassicLevel } from "classic-level";
 import { parseFile } from "music-metadata";
 import YAML from "yaml";
+import { assertResponse } from "./cloud.js";
 import { creativeTonieDetailQuery, listCreativeToniesQuery } from "./queries.js";
 
 export type Chapter = {
@@ -455,6 +456,7 @@ export function isExpired(jwt: string): boolean {
 }
 
 async function tokenResponse(response: Response, action: string): Promise<{ access_token: string; refresh_token?: string; id_token?: string }> {
+  await assertResponse(response, `Token ${action} failed with HTTP ${response.status}; sign in to Tonies again`);
   const text = await response.text();
   let json: { access_token?: string; refresh_token?: string; id_token?: string; error?: string; error_description?: string };
   try {
@@ -462,7 +464,7 @@ async function tokenResponse(response: Response, action: string): Promise<{ acce
   } catch {
     throw new Error(`Token ${action} failed with HTTP ${response.status}: ${text.slice(0, 500)}`);
   }
-  if (!response.ok || !json.access_token) {
+  if (!json.access_token) {
     const detail = json.error_description ?? json.error ?? text.slice(0, 500);
     throw new Error(
       `Token ${action} failed: ${detail}.\n` +
@@ -479,7 +481,7 @@ export async function refreshToken(refreshTokenValue: string): Promise<RuntimeAu
     refresh_token: refreshTokenValue,
     client_id: "my-tonies"
   });
-  const response = await fetch(tokenUrl, { method: "POST", body });
+  const response = await fetch(tokenUrl, { method: "POST", body, redirect: "error", signal: AbortSignal.timeout(15000) });
   const json = await tokenResponse(response, "refresh");
   return {
     accessToken: json.access_token,
@@ -498,7 +500,7 @@ export async function loginWithPassword(options: PasswordLoginOptions = {}): Pro
     password,
     scope: "openid bx-profiles basic shop-de bx-user-attributes cloudservices web-origins shop-us email profile roles shop-uk"
   });
-  const response = await fetch(tokenUrl, { method: "POST", body });
+  const response = await fetch(tokenUrl, { method: "POST", body, redirect: "error", signal: AbortSignal.timeout(15000) });
   const json = await tokenResponse(response, "login");
   const auth = {
     accessToken: json.access_token,
@@ -568,19 +570,21 @@ export async function apiRequest(method: string, path: string, body?: unknown): 
         Authorization: `Bearer ${auth.accessToken}`,
         ...(body === undefined ? {} : { "content-type": "application/json" })
       },
-      body: body === undefined ? undefined : JSON.stringify(body)
+      body: body === undefined ? undefined : JSON.stringify(body),
+      redirect: "error",
+      signal: AbortSignal.timeout(15000)
     });
-    return { response, text: await response.text() };
+    return response;
   };
   let auth = await resolveAuth();
-  let { response, text } = await perform(auth);
+  let response = await perform(auth);
   if (response.status === 401) {
+    await response.body?.cancel();
     auth = await recoverAuth(auth);
-    ({ response, text } = await perform(auth));
+    response = await perform(auth);
   }
-  if (!response.ok) {
-    throw new Error(`API ${method} ${path} -> ${response.status} ${response.statusText}: ${text.slice(0, 500)}`);
-  }
+  await assertResponse(response, `API ${method} ${path} -> ${response.status} ${response.statusText}`);
+  const text = await response.text();
   try {
     return text ? JSON.parse(text) : { status: response.status };
   } catch {
@@ -651,10 +655,9 @@ export async function uploadFile(path: string, title?: string, seconds?: number)
   const form = new FormData();
   for (const [key, value] of Object.entries(upload.request.fields)) form.append(key, value);
   form.append("file", file, upload.fileId);
-  const uploadResponse = await fetch(upload.request.url, { method: "POST", body: form });
-  if (!uploadResponse.ok) {
-    throw new Error(`File upload for ${path} failed with ${uploadResponse.status} ${uploadResponse.statusText}: ${(await uploadResponse.text()).slice(0, 500)}`);
-  }
+  const uploadResponse = await fetch(upload.request.url, { method: "POST", body: form, redirect: "error" });
+  await assertResponse(uploadResponse, `File upload for ${path} failed with ${uploadResponse.status} ${uploadResponse.statusText}`);
+  await uploadResponse.body?.cancel();
   return {
     id: upload.fileId,
     file: upload.fileId,

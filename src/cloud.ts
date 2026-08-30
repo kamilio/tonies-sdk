@@ -75,7 +75,7 @@ type AuthWriter = {
   promise: Promise<ToniesAuth>;
 };
 
-async function assertResponse(response: Response, message: string): Promise<void> {
+export async function assertResponse(response: Response, message: string): Promise<void> {
   if (!response.ok) await response.body?.cancel();
   assert(response.ok, message);
 }

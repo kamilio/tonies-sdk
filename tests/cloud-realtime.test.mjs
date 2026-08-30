@@ -831,7 +831,9 @@ test("late work from a closed session cannot command a newly connected session",
   assert.equal(socket.published.length, 0);
 });
 
-test("10000 confirmed controls release cancellation scopes and retained heap", async context => {
+test("confirmed controls release cancellation scopes and retained heap", async context => {
+  const iterations = Number(process.env.TONIES_CONTROL_SOAK_ITERATIONS ?? 10000);
+  assert(Number.isSafeInteger(iterations) && iterations >= 1 && iterations <= 1000000, "Control soak iterations must be an integer from 1 to 1000000");
   const { live, socket, send } = await fixture();
   context.after(() => live.disconnect());
   const controller = new AbortController();
@@ -847,7 +849,7 @@ test("10000 confirmed controls release cancellation scopes and retained heap", a
   global.gc?.();
   const baseline = process.memoryUsage().heapUsed;
   const started = performance.now();
-  for (let index = 0; index < 10000; index++) await confirm();
+  for (let index = 0; index < iterations; index++) await confirm();
   await new Promise(resolve => setImmediate(resolve));
   global.gc?.();
   await new Promise(resolve => setImmediate(resolve));
@@ -858,7 +860,7 @@ test("10000 confirmed controls release cancellation scopes and retained heap", a
   assert.equal(live.states.size, 1);
   assert.equal(getEventListeners(controller.signal, "abort").length, 0);
   if (global.gc) assert(retained < 2 * 1024 * 1024, `Confirmed controls retained ${retained} heap bytes`);
-  context.diagnostic(`10000 confirmed controls: ${(performance.now() - started).toFixed(1)} ms; retained heap delta ${retained} bytes${global.gc ? " after GC" : " (GC not forced)"}`);
+  context.diagnostic(`${iterations} confirmed controls: ${(performance.now() - started).toFixed(1)} ms; retained heap delta ${retained} bytes${global.gc ? " after GC" : " (GC not forced)"}`);
 });
 
 test("broker loss removes a confirmed command only once", async context => {
