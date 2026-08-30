@@ -111,6 +111,7 @@ export class ToniesRealtime extends EventEmitter {
         clientId: `${username}_tonies_sdk_${randomUUID()}`,
         username, password,
         reconnectPeriod: this.options.reconnectPeriod ?? 5000,
+        reconnectOnConnackError: true,
         connectTimeout: this.options.timeoutMs ?? 15000,
         clean: true
       });

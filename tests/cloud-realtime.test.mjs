@@ -20,7 +20,7 @@ function deferred() {
 
 function memoryBroker() {
   const mqttPacket = createRequire(import.meta.resolve("mqtt"))("mqtt-packet");
-  const broker = { acknowledged: false, published: [], connections: 0 };
+  const broker = { acknowledged: false, published: [], connections: 0, accept: () => true };
   broker.connector = async (_, options) => {
     const client = new MqttClient(() => {
       broker.connections++;
@@ -28,7 +28,7 @@ function memoryBroker() {
       const transport = new Duplex({ read() {}, write(bytes, encoding, callback) { parser.parse(bytes); callback(); } });
       const send = packet => transport.push(mqttPacket.generate(packet, { protocolVersion: 5 }));
       parser.on("packet", packet => {
-        if (packet.cmd === "connect") send({ cmd: "connack", sessionPresent: false, reasonCode: 0 });
+        if (packet.cmd === "connect") send({ cmd: "connack", sessionPresent: false, reasonCode: broker.accept(packet.password?.toString()) ? 0 : 135 });
         if (packet.cmd === "subscribe") {
           send({ cmd: "suback", messageId: packet.messageId, granted: packet.subscriptions.map(() => 1) });
           send({ cmd: "publish", topic: "external/toniebox/AABBCCDDEEFF/online-state", payload: '{"onlineState":"connected"}', qos: 0, retain: true });
@@ -546,6 +546,25 @@ test("real MQTT transport never replays an expired command after reconnect", { t
   assert.equal(broker.connections, 2);
   assert.equal(broker.published.length, 2);
   assert.equal(Object.keys(broker.client.outgoing).length, 0);
+});
+
+test("a denied reconnect can recover once credentials rotate", { timeout: 3000 }, async context => {
+  const broker = memoryBroker();
+  const cloud = new TonieCloudClient({ auth: { accessToken: "original", expiresAt: Date.now() + 3600000 }, fetch: async () => response({ uuid: "account" }) });
+  const live = new ToniesRealtime(cloud, { connect: broker.connector });
+  const denied = deferred();
+  live.on("error", error => { if (error.code === 135) denied.resolve(); });
+  context.after(() => live.disconnect());
+  await live.connect([box]);
+  broker.accept = password => password === "repaired";
+  broker.transport.destroy();
+  await denied.promise;
+  const reconnected = deferred();
+  live.once("connected", () => reconnected.resolve());
+  await cloud.setAuth({ accessToken: "repaired", expiresAt: Date.now() + 3600000 });
+  await reconnected.promise;
+  assert(broker.connections >= 3);
+  await live.waitForState(box.id, state => state.onlineState === "connected");
 });
 
 test("retained snapshots and duplicate playback events never trigger false starts", async () => {
