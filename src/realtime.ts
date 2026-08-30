@@ -242,7 +242,12 @@ export class ToniesRealtime extends EventEmitter {
     const state = { ...previous };
     if (suffix === "online-state") {
       state.onlineState = payload.onlineState as string;
-      if (state.onlineState !== "connected") state.playback = undefined;
+      if (state.onlineState !== "connected") {
+        state.playback = undefined;
+        state.volume = undefined;
+        state.bedtime = undefined;
+        state.headphones = undefined;
+      }
     }
     if (suffix === "metrics/battery") state.battery = payload;
     if (suffix === "metrics/headphones") state.headphones = payload;

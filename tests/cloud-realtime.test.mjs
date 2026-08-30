@@ -1334,14 +1334,26 @@ test("playback state distinguishes stopped/download/blocked and estimates positi
   assert.equal(playbackPosition({}), undefined);
 });
 
-test("empty retained-topic updates clear playback and offline snapshots do not keep playing state", async () => {
+test("offline snapshots invalidate volatile telemetry before a box wakes", async () => {
   const { live, socket, send } = await fixture();
   send("playback/state", { tonie: "TONIE", chapter: 0, paused: false }, true);
   socket.emit("message", "external/toniebox/AABBCCDDEEFF/playback/state", Buffer.alloc(0), { retain: false });
   assert.deepEqual(live.states.get(box.id).playback, {});
   send("playback/state", { tonie: "TONIE", chapter: 0, paused: false });
+  send("volume/state", { level: 5 }, true);
+  send("app-reply/bedtime-state", { stl: { state: "on", duration: 1800 } }, true);
+  send("metrics/headphones", { connected: ["headphones"] }, true);
+  send("metrics/battery", { percent: 80 }, true);
   send("online-state", { onlineState: "offline" });
-  assert.equal(live.states.get(box.id).playback, undefined);
+  for (const field of ["playback", "volume", "bedtime", "headphones"]) assert.equal(live.states.get(box.id)[field], undefined);
+  assert.equal(live.states.get(box.id).battery.percent, 80);
+  send("online-state", { onlineState: "connected" });
+  const volume = live.changeVolume(box.id, 1);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(socket.published.length, 0);
+  send("volume/state", { level: 10 });
+  await volume;
+  assert.deepEqual(JSON.parse(socket.published[0][1]), { level: 11 });
   await live.disconnect();
 });
 

@@ -92,6 +92,8 @@ For a device lifecycle or caller-owned cancellation scope, use `realtime.withCan
 
 Playback controls also reject a known Tonie replacement during asynchronous command preparation, before publishing. Chapter indices and millisecond positions must be nonnegative safe integers. Relative chapter and volume methods use the current cached telemetry; serialize and confirm repeated relative controls so each operation uses the preceding device result rather than repeating a stale target.
 
+When a box goes offline, its playback, volume, bedtime, and headphone snapshots become unknown until new telemetry arrives; waking alone does not restore these stale values. Battery readings remain available as last-known measurements.
+
 ## Verification
 
 `npm run test:memory` runs realtime and audio regressions with explicit garbage collection, including 100 real MQTT connection lifecycles against an in-memory broker, 10,000 confirmed controls, retained-heap bounds, 128 MiB upload/hash fixtures, bounded reader concurrency, and failure drainage.
