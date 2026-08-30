@@ -620,6 +620,72 @@ test("confirmation timeout cancels commands still waiting for initial telemetry"
   assert.equal(live.listenerCount("state"), 0);
 });
 
+test("caller cancellation scopes stop telemetry waits without closing the shared session", async context => {
+  const { live, socket, send } = await fixture({ disconnected: true });
+  context.after(() => live.disconnect());
+  await live.connect([box]);
+  const controller = new AbortController();
+  let operationSignal;
+  const pending = live.withCancellation(controller.signal, async signal => { operationSignal = signal; return live.pause(box.id); });
+  const rejected = assert.rejects(pending, { name: "AbortError" });
+  controller.abort();
+  await rejected;
+  send("online-state", { onlineState: "connected" }, true);
+  assert(operationSignal.aborted);
+  assert.equal(socket.published.length, 0);
+  assert.equal(getEventListeners(controller.signal, "abort").length, 0);
+  assert((await live.pause(box.id)).acknowledged);
+});
+
+test("cancellation scopes compose, expire after success, and reject aborted callers", async context => {
+  const { live, socket } = await fixture();
+  context.after(() => live.disconnect());
+  const outer = new AbortController();
+  const inner = new AbortController();
+  const blocked = deferred();
+  let late;
+  let signal;
+  const result = await live.withCancellation(outer.signal, async inherited => {
+    signal = inherited;
+    late = blocked.promise.then(() => live.withCancellation(inner.signal, () => live.pause(box.id)));
+    return { ready: true };
+  });
+  assert(result.ready);
+  assert(signal.aborted);
+  const rejected = assert.rejects(late, { name: "AbortError" });
+  blocked.resolve();
+  await rejected;
+  outer.abort();
+  let invoked = false;
+  await assert.rejects(live.withCancellation(outer.signal, async () => { invoked = true; }), { name: "AbortError" });
+  assert.equal(invoked, false);
+  assert.equal(socket.published.length, 0);
+  assert.equal(getEventListeners(outer.signal, "abort").length, 0);
+  assert.equal(getEventListeners(inner.signal, "abort").length, 0);
+});
+
+test("caller cancellation removes unacknowledged commands and releases nested confirmations", async context => {
+  const { live, socket, send } = await fixture();
+  context.after(() => live.disconnect());
+  const controller = new AbortController();
+  const publish = socket.publishAsync;
+  socket.publishAsync = (...args) => { socket.published.push(args); return new Promise(() => {}); };
+  const pending = live.withCancellation(controller.signal, () => live.withConfirmation(box.id, "app-reply/bedtime-state", state => state.bedtime?.stl?.state === "on", () => live.sleepTimer(box.id, 1800)));
+  const rejected = assert.rejects(pending, { name: "AbortError" });
+  await new Promise(resolve => setImmediate(resolve));
+  controller.abort();
+  await rejected;
+  assert.deepEqual(socket.removed, [1]);
+  assert.equal(live.listenerCount("state"), 0);
+  assert.equal(getEventListeners(controller.signal, "abort").length, 0);
+  assert.equal(live.states.get(box.id).onlineState, "connected");
+  socket.publishAsync = publish;
+  const next = live.withConfirmation(box.id, "app-reply/bedtime-state", state => state.bedtime?.stl?.state === "off", () => live.sleepTimer(box.id, 0));
+  await new Promise(resolve => setImmediate(resolve));
+  send("app-reply/bedtime-state", { stl: { state: "off" } });
+  assert((await next).deviceConfirmed);
+});
+
 test("confirmation timeout removes commands still awaiting broker acknowledgment", async context => {
   const { live, socket } = await fixture();
   context.after(() => live.disconnect());
@@ -696,14 +762,15 @@ test("late work from a closed session cannot command a newly connected session",
 test("10000 confirmed controls release cancellation scopes and retained heap", async context => {
   const { live, socket, send } = await fixture();
   context.after(() => live.disconnect());
+  const controller = new AbortController();
   let messageId = 0;
   socket.publishAsync = async () => {};
   socket.getLastMessageId = () => ++messageId;
-  const confirm = () => live.withConfirmation(box.id, "volume/state", state => state.volume?.level === 4, async () => {
+  const confirm = () => live.withCancellation(controller.signal, () => live.withConfirmation(box.id, "volume/state", state => state.volume?.level === 4, async () => {
     const result = await live.setVolume(box.id, 4);
     send("volume/state", { level: 4 });
     return result;
-  });
+  }));
   for (let index = 0; index < 20; index++) await confirm();
   global.gc?.();
   const baseline = process.memoryUsage().heapUsed;
@@ -717,6 +784,7 @@ test("10000 confirmed controls release cancellation scopes and retained heap", a
   assert.equal(live.listenerCount("state"), 0);
   assert.equal(live.listenerCount("error"), 0);
   assert.equal(live.states.size, 1);
+  assert.equal(getEventListeners(controller.signal, "abort").length, 0);
   if (global.gc) assert(retained < 2 * 1024 * 1024, `Confirmed controls retained ${retained} heap bytes`);
   context.diagnostic(`10000 confirmed controls: ${(performance.now() - started).toFixed(1)} ms; retained heap delta ${retained} bytes${global.gc ? " after GC" : " (GC not forced)"}`);
 });

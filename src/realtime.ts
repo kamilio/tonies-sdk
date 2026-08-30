@@ -316,6 +316,19 @@ export class ToniesRealtime extends EventEmitter {
     }
   }
 
+  async withCancellation<Result>(signal: AbortSignal, operation: (signal: AbortSignal) => Promise<Result>): Promise<Result> {
+    const controller = new AbortController();
+    const parentSignal = controlContext.getStore();
+    const disposeSignals = followAbortSignals(controller, [signal, ...parentSignal ? [parentSignal] : []]);
+    try {
+      controller.signal.throwIfAborted();
+      return await controlContext.run(controller.signal, operation, controller.signal);
+    } finally {
+      controller.abort();
+      disposeSignals();
+    }
+  }
+
   async withConfirmation<Result extends object>(boxId: string, topic: typeof TONIES_STATE_TOPICS[number], predicate: (state: TonieboxState) => boolean, operation: (signal: AbortSignal) => Promise<Result>, timeoutMs = 10000) {
     assert(this.session && this.boxes.has(boxId), "Connect to this Toniebox first");
     assert(this.session.brokerOnline && this.connection?.connected, "Tonies realtime broker disconnected; cannot start device confirmation");
@@ -324,22 +337,17 @@ export class ToniesRealtime extends EventEmitter {
     const confirmations = this.session.confirmations;
     const key = JSON.stringify([boxId, topic]);
     assert(!confirmations.has(key), "A device confirmation is already pending for this Toniebox topic");
-    const controller = new AbortController();
-    const parentSignal = controlContext.getStore();
-    const disposeSignals = followAbortSignals(controller, [this.session.brokerController.signal, ...parentSignal ? [parentSignal] : []]);
-    const signal = controller.signal;
-    signal.throwIfAborted();
     confirmations.add(key);
-    const confirmed = this.waitForState(boxId, predicate, timeoutMs, { fresh: true, live: true, topic, signal });
     try {
-      const [result, state] = await Promise.all([Promise.resolve().then(() => {
-        signal.throwIfAborted();
-        return controlContext.run(signal, operation, signal);
-      }), confirmed]);
-      return { ...result, state, deviceConfirmed: true as const };
+      return await this.withCancellation(this.session.brokerController.signal, async signal => {
+        const confirmed = this.waitForState(boxId, predicate, timeoutMs, { fresh: true, live: true, topic, signal });
+        const [result, state] = await Promise.all([Promise.resolve().then(() => {
+          signal.throwIfAborted();
+          return operation(signal);
+        }), confirmed]);
+        return { ...result, state, deviceConfirmed: true as const };
+      });
     } finally {
-      controller.abort();
-      disposeSignals();
       confirmations.delete(key);
     }
   }

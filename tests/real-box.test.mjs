@@ -5,10 +5,14 @@ import { resolveAuth, writeStorageAuth } from "../dist/client.js";
 import { TonieCloudClient, isToniebox2 } from "../dist/cloud.js";
 import { ToniesRealtime } from "../dist/realtime.js";
 
+const soakSeconds = Number(process.env.TONIES_LIVE_SOAK_SECONDS ?? 420);
+const validSoakDuration = Number.isInteger(soakSeconds) && soakSeconds >= 420 && soakSeconds <= 86400;
+
 test("read-only idle MQTT survives token expiry without REST polling", {
   skip: !process.env.TONIES_LIVE_SOAK,
-  timeout: 450000
+  timeout: validSoakDuration ? soakSeconds * 1000 + 60000 : 1000
 }, async context => {
+  assert(validSoakDuration, "TONIES_LIVE_SOAK_SECONDS must be an integer from 420 to 86400");
   const cloud = new TonieCloudClient({ auth: await resolveAuth(), onAuth: writeStorageAuth });
   const boxes = (await cloud.listTonieboxes()).filter(isToniebox2);
   assert(boxes.length, "The idle soak requires at least one Toniebox 2 on the account, even if it is offline");
@@ -18,20 +22,41 @@ test("read-only idle MQTT survives token expiry without REST polling", {
   realtime.on("disconnected", () => observations.disconnects++);
   realtime.on("error", () => observations.errors++);
   cloud.on("auth", () => observations.rotations++);
+  const memory = { baselineBytes: 0, peakBytes: 0, finalBytes: 0, samples: 0, maxStates: 0, maxAuthListeners: 0 };
+  const sample = () => {
+    global.gc?.();
+    memory.finalBytes = process.memoryUsage().heapUsed;
+    memory.peakBytes = Math.max(memory.peakBytes, memory.finalBytes);
+    memory.maxStates = Math.max(memory.maxStates, realtime.states.size);
+    memory.maxAuthListeners = Math.max(memory.maxAuthListeners, cloud.listenerCount("auth"));
+    memory.samples++;
+  };
+  let sampling;
   try {
     await realtime.connect(boxes);
     const initial = cloud.auth.accessToken;
     const expiresAt = cloud.auth.expiresAt ?? JSON.parse(Buffer.from(initial.split(".")[1], "base64url").toString()).exp * 1000;
-    assert(expiresAt < Date.now() + 360000, "The seven-minute soak must extend past the initial token lifetime");
-    context.diagnostic(`Observing ${boxes.length} boxes for seven minutes without sending commands or polling REST state`);
-    await new Promise(resolve => setTimeout(resolve, 420000));
+    assert(expiresAt < Date.now() + (soakSeconds - 60) * 1000, "The soak must extend past the initial token lifetime");
+    for (const box of boxes) await realtime.waitForState(box.id, state => state.onlineState !== undefined && state.onlineState !== "unknown", 10000);
+    await new Promise(resolve => setImmediate(resolve));
+    sample();
+    memory.baselineBytes = memory.finalBytes;
+    sampling = setInterval(sample, 60000);
+    context.diagnostic(`Observing ${boxes.length} boxes for ${soakSeconds} seconds without sending commands or polling REST state`);
+    await new Promise(resolve => setTimeout(resolve, soakSeconds * 1000));
     assert.notEqual(cloud.auth.accessToken, initial, "Idle connections must renew their access token");
     assert(observations.rotations > 0);
     for (const box of boxes) {
       await realtime.waitForState(box.id, state => state.onlineState !== undefined && state.onlineState !== "unknown", 10000);
     }
-    context.diagnostic(JSON.stringify({ ...observations, states: realtime.states.size, heapBytes: process.memoryUsage().heapUsed }));
+    sample();
+    assert.equal(memory.maxStates, boxes.length);
+    assert.equal(memory.maxAuthListeners, 2);
+    const retainedBytes = memory.finalBytes - memory.baselineBytes;
+    if (global.gc) assert(retainedBytes < 16 * 1024 * 1024, `Idle MQTT retained ${retainedBytes} heap bytes`);
+    context.diagnostic(JSON.stringify({ ...observations, states: realtime.states.size, ...memory, retainedBytes, forcedGc: Boolean(global.gc) }));
   } finally {
+    clearInterval(sampling);
     await realtime.disconnect();
   }
 });
