@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { EventEmitter, getEventListeners, once } from "node:events";
+import { createServer } from "node:http";
 import { createRequire } from "node:module";
 import { Duplex } from "node:stream";
 import { MqttClient } from "mqtt";
@@ -264,6 +265,57 @@ test("SDK surfaces HTTP and GraphQL failures rather than false success", async (
   const auth = { accessToken: jwt() };
   await assert.rejects(new TonieCloudClient({ auth, fetch: async () => new Response(null, { status: 403 }) }).request("GET", "/me"), /403/);
   await assert.rejects(new TonieCloudClient({ auth, fetch: async () => response({ errors: [{ message: "Denied" }] }) }).graphql("{}"), /Denied/);
+});
+
+test("failed authentication, REST, and schema responses release unread streams", async () => {
+  for (const operation of [cloud => cloud.login("user", "password"), cloud => cloud.request("GET", "/me"), cloud => cloud.openApi()]) {
+    let cancelled = 0;
+    let pulls = 0;
+    const stream = new ReadableStream({ pull(controller) { pulls++; controller.enqueue(new Uint8Array(1024)); }, cancel() { cancelled++; } });
+    const cloud = new TonieCloudClient({ auth: { accessToken: jwt() }, fetch: async () => new Response(stream, { status: 503 }) });
+    await assert.rejects(operation(cloud), /503/);
+    assert.equal(cancelled, 1);
+    assert(pulls <= 1, "Failed responses must not be downloaded before rejecting");
+    assert.equal(stream.locked, false);
+  }
+});
+
+test("both unauthorized attempts release their response bodies before rejection", async () => {
+  let cancelled = 0;
+  let requests = 0;
+  const cloud = new TonieCloudClient({ auth: { accessToken: jwt(), refreshToken: "refresh" }, fetch: async url => {
+    if (url.includes("openid-connect")) return response({ access_token: jwt(), refresh_token: "rotated", expires_in: 300 });
+    requests++;
+    return new Response(new ReadableStream({ cancel() { cancelled++; } }), { status: 401 });
+  } });
+  await assert.rejects(cloud.request("GET", "/me"), /401/);
+  assert.equal(requests, 2);
+  assert.equal(cancelled, 2);
+});
+
+test("native fetch closes failed streaming responses instead of waiting for request timeout", { timeout: 5000 }, async context => {
+  let released;
+  let requests = 0;
+  const server = createServer((request, response) => {
+    requests++;
+    const current = released;
+    response.on("close", () => current.resolve());
+    response.writeHead(503);
+    response.write(Buffer.alloc(65536));
+  });
+  context.after(async () => {
+    server.closeAllConnections();
+    await new Promise(resolve => server.close(resolve));
+  });
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  const cloud = new TonieCloudClient({ auth: { accessToken: jwt() }, fetch: (url, init) => fetch(`http://127.0.0.1:${server.address().port}`, init) });
+  for (let index = 0; index < 32; index++) {
+    released = deferred();
+    await assert.rejects(cloud.request("GET", "/me"), /503/);
+    await released.promise;
+  }
+  assert.equal(requests, 32);
 });
 
 test("OpenAPI operation dispatch includes shared path params and required query/body values", async () => {

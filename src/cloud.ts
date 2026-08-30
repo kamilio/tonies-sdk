@@ -75,6 +75,11 @@ type AuthWriter = {
   promise: Promise<ToniesAuth>;
 };
 
+async function assertResponse(response: Response, message: string): Promise<void> {
+  if (!response.ok) await response.body?.cancel();
+  assert(response.ok, message);
+}
+
 export function toniesPath(...segments: string[]): string {
   return `/${segments.map(encodeURIComponent).join("/")}`;
 }
@@ -167,7 +172,7 @@ export class TonieCloudClient extends EventEmitter {
       await response.body?.cancel();
       return this.auth;
     }
-    assert(response.ok, `Tonies authentication failed (HTTP ${response.status})`);
+    await assertResponse(response, `Tonies authentication failed (HTTP ${response.status})`);
     const token = await response.json() as { access_token: string; refresh_token?: string; id_token?: string; expires_in: number };
     assert(token.access_token, "Tonies did not return an access token");
     assert(Number.isFinite(token.expires_in) && token.expires_in > 0, "Tonies did not return a valid token lifetime");
@@ -247,7 +252,7 @@ export class TonieCloudClient extends EventEmitter {
       if (accessToken === this.auth.accessToken) await this.refresh();
       response = await perform(await this.accessToken());
     }
-    assert(response.ok, `Tonies ${method} ${path} failed (HTTP ${response.status})`);
+    await assertResponse(response, `Tonies ${method} ${path} failed (HTTP ${response.status})`);
     const text = await response.text();
     return (text ? JSON.parse(text) : { status: response.status }) as T;
   }
@@ -290,7 +295,7 @@ export class TonieCloudClient extends EventEmitter {
 
   async openApi(): Promise<ToniesOpenApi> {
     const response = await this.fetcher(TONIES_OPENAPI_URL, { signal: AbortSignal.timeout(this.options.timeoutMs ?? 15000) });
-    assert(response.ok, `Tonies OpenAPI HTTP ${response.status}`);
+    await assertResponse(response, `Tonies OpenAPI HTTP ${response.status}`);
     return response.json() as Promise<ToniesOpenApi>;
   }
 

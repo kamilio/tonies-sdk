@@ -8,6 +8,8 @@ Set `TONIES_EMAIL` and `TONIES_PASSWORD`, then run `tonies auth login`. The desk
 
 Before discarding a cloud client, stop its realtime connection and other request producers, then await `cloud.flushAuth()`. This drains already-started authentication and token persistence without starting a new request, so an in-flight refresh cannot lose its rotated refresh token during teardown. Keep the persistence callback active until draining finishes, and serialize replacement clients behind that barrier. Authentication or persistence failures still reject after the pending work settles.
 
+Failed HTTP response streams are canceled before status errors are surfaced, including the final failed response after a token-refresh retry; error bodies are not downloaded into memory.
+
 ## Management
 
 ```
