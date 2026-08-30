@@ -44,6 +44,15 @@ export type TonieboxEvent = {
   previous: TonieboxState;
 };
 
+type RealtimeSession = {
+  controller: AbortController;
+  commands: Map<number, () => void>;
+  brokerOnline: boolean;
+  connection?: MqttClient;
+  dispose?: () => void;
+  ending?: Promise<void>;
+};
+
 export function isPlaying(playback?: PlaybackState): boolean {
   return Boolean(playback?.tonie && playback.paused === false && !playback.ended && !playback.blocked && !playback.downloading);
 }
@@ -59,43 +68,93 @@ export function playbackPosition(playback: PlaybackState, now = Date.now()): num
 export class ToniesRealtime extends EventEmitter {
   readonly states = new Map<string, TonieboxState>();
   private connection?: MqttClient;
+  private session?: RealtimeSession;
   private boxes = new Map<string, Toniebox>();
-  private readonly authListener = (auth: { accessToken?: string }) => {
-    if (this.connection) this.connection.options.password = auth.accessToken;
-  };
+  private routes = new Map<string, { boxId: string; suffix: string }>();
 
   constructor(readonly cloud: TonieCloudClient, private readonly options: {
     connect?: (url: string, options: IClientOptions) => Promise<MqttClient>;
     reconnectPeriod?: number;
     timeoutMs?: number;
-  } = {}) { super(); }
+    commandTimeoutMs?: number;
+  } = {}) {
+    super({ captureRejections: true });
+    this.on("message", async (topic: string, bytes: Buffer, packet: Pick<IPublishPacket, "retain">) => this.receive(topic, bytes, packet));
+  }
 
   async connect(boxes: Toniebox[]): Promise<void> {
-    assert(!this.connection, "Realtime client is already connected");
+    assert(!this.session, "Realtime client is already connected or connecting");
     const supported = boxes.filter(box => tonieboxCapabilities(box).realtime);
     assert(supported.length, "These Tonieboxes do not support realtime controls");
-    for (const box of supported) this.boxes.set(box.id, box);
-    const me = await this.cloud.request<{ uuid?: string; id?: string }>("GET", "/me");
-    const username = me.uuid ?? me.id;
-    assert(username, "Tonies account has no MQTT identity");
-    this.connection = await (this.options.connect ?? connectAsync)(TONIES_MQTT_URL, {
-      protocolVersion: 5,
-      clientId: `${username}_tonies_sdk_${randomUUID()}`,
-      username,
-      password: await this.cloud.accessToken(),
-      reconnectPeriod: this.options.reconnectPeriod ?? 5000,
-      connectTimeout: this.options.timeoutMs ?? 15000,
-      clean: true
-    });
-    this.cloud.on("auth", this.authListener);
-    this.connection.on("message", (topic, payload, packet) => this.receive(topic, payload, packet));
-    this.connection.on("connect", () => this.emit("connected"));
-    this.connection.on("offline", () => this.emit("disconnected"));
-    this.connection.on("close", () => this.emit("disconnected"));
-    this.connection.on("error", error => this.emit("error", error));
-    const topics = supported.flatMap(box => TONIES_STATE_TOPICS.map(topic => this.topic(box, topic)));
-    await this.connection.subscribeAsync(topics, { qos: 1 });
-    this.emit("connected");
+    const session: RealtimeSession = { controller: new AbortController(), commands: new Map(), brokerOnline: false };
+    this.session = session;
+    let ready = false;
+    try {
+      const me = await this.cloud.request<{ uuid?: string; id?: string }>("GET", "/me");
+      session.controller.signal.throwIfAborted();
+      const username = me.uuid ?? me.id;
+      assert(username, "Tonies account has no MQTT identity");
+      const password = await this.cloud.accessToken();
+      session.controller.signal.throwIfAborted();
+      const connection = await (this.options.connect ?? connectAsync)(TONIES_MQTT_URL, {
+        protocolVersion: 5,
+        clientId: `${username}_tonies_sdk_${randomUUID()}`,
+        username, password,
+        reconnectPeriod: this.options.reconnectPeriod ?? 5000,
+        connectTimeout: this.options.timeoutMs ?? 15000,
+        clean: true
+      });
+      session.connection = connection;
+      session.controller.signal.throwIfAborted();
+      this.connection = connection;
+      for (const box of supported) {
+        this.boxes.set(box.id, box);
+        for (const suffix of TONIES_STATE_TOPICS) this.routes.set(this.topic(box, suffix), { boxId: box.id, suffix });
+      }
+      const auth = (auth: { accessToken?: string }) => { connection.options.password = auth.accessToken; };
+      const message = (topic: string, payload: Buffer, packet: IPublishPacket) => {
+        if (!session.controller.signal.aborted) this.emit("message", topic, payload, packet);
+      };
+      const connected = () => {
+        session.brokerOnline = true;
+        this.emit("connected");
+      };
+      const disconnected = () => {
+        if (!session.brokerOnline) return;
+        session.brokerOnline = false;
+        for (const cancel of session.commands.values()) cancel();
+        for (const [boxId, previous] of this.states) {
+          const state = { onlineState: "unknown" };
+          this.states.set(boxId, state);
+          this.emit("state", { boxId, topic: "connection", payload: {}, retained: true, previous, state });
+        }
+        this.emit("disconnected");
+      };
+      const error = (error: Error) => this.emit("error", error);
+      this.cloud.on("auth", auth);
+      connection.on("message", message);
+      connection.on("connect", connected);
+      connection.on("offline", disconnected);
+      connection.on("close", disconnected);
+      connection.on("error", error);
+      session.dispose = () => {
+        this.cloud.off("auth", auth);
+        connection.off("message", message);
+        connection.off("connect", connected);
+        connection.off("offline", disconnected);
+        connection.off("close", disconnected);
+        connection.off("error", error);
+      };
+      await connection.subscribeAsync([...this.routes.keys()], { qos: 1 });
+      session.controller.signal.throwIfAborted();
+      ready = true;
+      connected();
+    } finally {
+      if (!ready) {
+        if (this.session === session) await this.disconnect();
+        else await this.closeSession(session);
+      }
+    }
   }
 
   private topic(box: Toniebox, suffix: string): string {
@@ -103,11 +162,13 @@ export class ToniesRealtime extends EventEmitter {
   }
 
   receive(topic: string, bytes: Buffer, packet: Pick<IPublishPacket, "retain">): void {
-    const box = [...this.boxes.values()].find(box => topic.startsWith(this.topic(box, "")));
-    if (!box) return;
-    const suffix = topic.slice(this.topic(box, "").length);
+    const route = this.routes.get(topic);
+    if (!route) return;
+    const { boxId, suffix } = route;
+    assert(bytes.length <= 65536, "Toniebox state payload exceeds 64 KiB");
     const payload = (bytes.length ? JSON.parse(bytes.toString()) : {}) as Record<string, unknown>;
-    const previous = this.states.get(box.id) ?? {};
+    assert(payload && typeof payload === "object" && !Array.isArray(payload), "Toniebox state must be a JSON object");
+    const previous = this.states.get(boxId) ?? {};
     const state = { ...previous };
     if (suffix === "online-state") {
       state.onlineState = payload.onlineState as string;
@@ -119,8 +180,8 @@ export class ToniesRealtime extends EventEmitter {
     if (suffix === "playback/state") state.playback = payload;
     if (suffix === "volume/state") state.volume = payload;
     if (suffix === "app-reply/bedtime-state") state.bedtime = payload;
-    this.states.set(box.id, state);
-    const event: TonieboxEvent = { boxId: box.id, topic: suffix, payload, retained: packet.retain, state, previous };
+    this.states.set(boxId, state);
+    const event: TonieboxEvent = { boxId, topic: suffix, payload, retained: packet.retain, state, previous };
     this.emit("state", event);
     if (packet.retain) return;
     if (suffix === "playback/state") {
@@ -135,10 +196,12 @@ export class ToniesRealtime extends EventEmitter {
   }
 
   async waitForState(boxId: string, predicate: (state: TonieboxState) => boolean, timeoutMs = 10000): Promise<TonieboxState> {
+    assert(this.session && this.boxes.has(boxId), "Connect to this Toniebox first");
     const controller = new AbortController();
+    const signal = AbortSignal.any([controller.signal, this.session.controller.signal]);
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
-      while (!predicate(this.states.get(boxId) ?? {})) await once(this, "state", { signal: controller.signal });
+      while (!predicate(this.states.get(boxId) ?? {})) await once(this, "state", { signal });
       return this.states.get(boxId)!;
     } finally {
       clearTimeout(timer);
@@ -147,15 +210,34 @@ export class ToniesRealtime extends EventEmitter {
 
   async command(boxId: string, command: string, payload: Record<string, unknown>) {
     const box = this.boxes.get(boxId);
-    assert(box && this.connection, "Connect to this Toniebox first");
+    const connection = this.connection;
+    const session = this.session;
+    assert(box && connection && session, "Connect to this Toniebox first");
     assert(/^[a-z][a-z0-9-]*$/.test(command), "Invalid control topic");
     const state = await this.waitForState(boxId, state => state.onlineState !== undefined);
     assert.equal(state.onlineState, "connected", "Toniebox is offline; cloud wake is not supported");
-    assert(this.connection.connected, "Tonies realtime broker is disconnected; commands are not queued");
+    assert(this.connection === connection && connection.connected && session.brokerOnline, "Tonies realtime broker is disconnected; commands are not queued");
+    assert(session.commands.size < 32, "At most 32 Toniebox commands may await acknowledgment");
     const topic = this.topic(box, `app-control/${command}`);
-    await this.connection.publishAsync(topic, JSON.stringify(payload), {
+    const published = connection.publishAsync(topic, JSON.stringify(payload), {
       qos: 1, retain: false, properties: { messageExpiryInterval: 10 }
     });
+    const messageId = connection.getLastMessageId();
+    let cancel!: () => void;
+    const interrupted = new Promise<never>((resolve, reject) => {
+      cancel = () => {
+        reject(new Error("Toniebox command acknowledgment interrupted or timed out; command removed from the outgoing queue"));
+        connection.removeOutgoingMessage(messageId);
+      };
+    });
+    session.commands.set(messageId, cancel);
+    const timer = setTimeout(cancel, this.options.commandTimeoutMs ?? 10000);
+    try {
+      await Promise.race([published, interrupted]);
+    } finally {
+      clearTimeout(timer);
+      session.commands.delete(messageId);
+    }
     return { boxId, command, payload, acknowledged: true, deviceConfirmed: false };
   }
 
@@ -207,11 +289,20 @@ export class ToniesRealtime extends EventEmitter {
   }
 
   async disconnect(): Promise<void> {
-    this.cloud.off("auth", this.authListener);
-    const connection = this.connection;
+    const session = this.session;
+    this.session = undefined;
     this.connection = undefined;
-    await connection?.endAsync(true);
     this.boxes.clear();
+    this.routes.clear();
     this.states.clear();
+    if (session) await this.closeSession(session);
+  }
+
+  private async closeSession(session: RealtimeSession): Promise<void> {
+    session.controller.abort();
+    for (const cancel of session.commands.values()) cancel();
+    session.dispose?.();
+    if (session.connection) session.ending ??= session.connection.endAsync(true);
+    await session.ending;
   }
 }

@@ -66,6 +66,12 @@ await realtime.disconnect();
 
 Event snapshots include `retained`, `previous`, and `state`. Retained MQTT snapshots populate capabilities but never generate transition events; duplicate packets do not trigger repeated starts. Events include playback started/paused/ended, Tonie changes, chapter changes, online changes, and sleep-timer changes. Keep cloud tokens fresh during long-running integrations by periodically reading cloud state; refreshed tokens update MQTT reconnect credentials. Disconnect on app/device removal.
 
+Register an `error` listener when embedding the realtime client: asynchronous subscriber failures and malformed state packets are reported through that event. Raw MQTT input is also observable through `message` (topic, bytes, packet); only known subscribed topics update state, and state payloads are limited to 64 KiB. Broker loss replaces cached state with an unknown-online snapshot without firing physical-box transition events.
+
+There can be at most 32 unacknowledged control commands. A command is removed from the MQTT outgoing store on broker loss, explicit disconnect, or acknowledgment timeout (10 seconds by default), preventing delayed replay after reconnect. State waiters are canceled on explicit disconnect. Concurrent connection attempts are rejected and partially opened connections are closed.
+
+Use `await cloud.setAuth(repairedAuth)` to adopt credentials from a new login rather than assigning the public auth field. This prevents an older in-flight refresh from replacing repaired credentials. Concurrent provider lookups and refreshes share requests; late HTTP 401 responses reuse an already rotated token instead of refreshing it again.
+
 ## Verification
 
-`npm test` runs offline regressions, including MQTT wire payloads, state transitions, strict device filtering, authentication isolation/rotation, and low-level operation routing. Destructive live Creative-Tonie tests are opt-in. Actual playback and sleep-light effects must be verified with an online device; tests using a fake broker cannot establish hardware behavior.
+`npm test` runs offline regressions, including MQTT wire payloads, state transitions, strict device filtering, authentication isolation/rotation, and low-level operation routing. An in-memory broker exercises the real MQTT client, including timeout removal and reconnect without command replay. Destructive live Creative-Tonie tests are opt-in. Actual playback and sleep-light effects must be verified with an online device; tests using a fake broker cannot establish hardware behavior.

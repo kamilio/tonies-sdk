@@ -96,6 +96,9 @@ export class TonieCloudClient extends EventEmitter {
   auth: ToniesAuth;
   private readonly fetcher: typeof fetch;
   private refreshing?: Promise<ToniesAuth>;
+  private loggingIn?: Promise<ToniesAuth>;
+  private providerAuth?: Promise<ToniesAuth>;
+  private authRevision = 0;
 
   constructor(private readonly options: {
     auth?: ToniesAuth;
@@ -109,50 +112,86 @@ export class TonieCloudClient extends EventEmitter {
     this.fetcher = options.fetch ?? globalThis.fetch;
   }
 
-  private async token(body: URLSearchParams): Promise<ToniesAuth> {
-    const response = await this.fetcher(TONIES_TOKEN_URL, {
-      method: "POST", body, signal: AbortSignal.timeout(this.options.timeoutMs ?? 15000)
-    });
-    assert(response.ok, `Tonies authentication failed (HTTP ${response.status})`);
-    const token = await response.json() as { access_token: string; refresh_token?: string; id_token?: string; expires_in: number };
-    assert(token.access_token, "Tonies did not return an access token");
-    this.auth = {
-      accessToken: token.access_token,
-      refreshToken: token.refresh_token ?? this.auth.refreshToken,
-      idToken: token.id_token,
-      expiresAt: Date.now() + token.expires_in * 1000
-    };
-    await this.options.onAuth?.(this.auth);
-    this.emit("auth", this.auth);
+  async setAuth(auth: ToniesAuth): Promise<ToniesAuth> {
+    const revision = ++this.authRevision;
+    this.refreshing = undefined;
+    this.loggingIn = undefined;
+    this.providerAuth = undefined;
+    return this.saveAuth(auth, revision);
+  }
+
+  private async saveAuth(auth: ToniesAuth, revision: number): Promise<ToniesAuth> {
+    this.auth = auth;
+    await this.options.onAuth?.(auth);
+    if (revision === this.authRevision) this.emit("auth", auth);
     return this.auth;
   }
 
+  private async token(body: URLSearchParams, revision: number): Promise<ToniesAuth> {
+    const previous = this.auth;
+    const response = await this.fetcher(TONIES_TOKEN_URL, {
+      method: "POST", body, redirect: "error", signal: AbortSignal.timeout(this.options.timeoutMs ?? 15000)
+    });
+    if (revision !== this.authRevision) {
+      await response.body?.cancel();
+      return this.auth;
+    }
+    assert(response.ok, `Tonies authentication failed (HTTP ${response.status})`);
+    const token = await response.json() as { access_token: string; refresh_token?: string; id_token?: string; expires_in: number };
+    assert(token.access_token, "Tonies did not return an access token");
+    assert(Number.isFinite(token.expires_in) && token.expires_in > 0, "Tonies did not return a valid token lifetime");
+    if (revision !== this.authRevision) return this.auth;
+    return this.saveAuth({
+      accessToken: token.access_token,
+      refreshToken: token.refresh_token ?? (body.get("grant_type") === "refresh_token" ? previous.refreshToken : undefined),
+      idToken: token.id_token,
+      expiresAt: Date.now() + token.expires_in * 1000
+    }, revision);
+  }
+
   async login(email: string, password: string): Promise<ToniesAuth> {
-    return this.token(new URLSearchParams({
+    const revision = ++this.authRevision;
+    this.refreshing = undefined;
+    const login = this.token(new URLSearchParams({
       grant_type: "password", client_id: "my-tonies", username: email, password,
       scope: "openid email profile"
-    }));
+    }), revision).finally(() => { if (this.loggingIn === login) this.loggingIn = undefined; });
+    this.loggingIn = login;
+    return login;
+  }
+
+  private async readProviderAuth(): Promise<ToniesAuth> {
+    if (!this.providerAuth) {
+      const revision = this.authRevision;
+      const lookup = this.options.getAuth!().then(auth => {
+        if (revision === this.authRevision) {
+          const changed = this.auth.accessToken !== auth.accessToken;
+          this.auth = auth;
+          if (changed) this.emit("auth", auth);
+        }
+        return this.auth;
+      }).finally(() => { if (this.providerAuth === lookup) this.providerAuth = undefined; });
+      this.providerAuth = lookup;
+    }
+    return this.providerAuth;
   }
 
   async refresh(): Promise<ToniesAuth> {
-    if (this.options.getAuth) {
-      this.auth = await this.options.getAuth();
-      this.emit("auth", this.auth);
-      return this.auth;
-    }
+    if (this.loggingIn) return this.loggingIn;
+    if (this.options.getAuth) return this.readProviderAuth();
     assert(this.auth.refreshToken, "Sign in to Tonies first");
-    this.refreshing ??= this.token(new URLSearchParams({
-      grant_type: "refresh_token", client_id: "my-tonies", refresh_token: this.auth.refreshToken
-    })).finally(() => { this.refreshing = undefined; });
+    if (!this.refreshing) {
+      const refreshing = this.token(new URLSearchParams({
+        grant_type: "refresh_token", client_id: "my-tonies", refresh_token: this.auth.refreshToken
+      }), this.authRevision).finally(() => { if (this.refreshing === refreshing) this.refreshing = undefined; });
+      this.refreshing = refreshing;
+    }
     return this.refreshing;
   }
 
   async accessToken(): Promise<string> {
-    if (this.options.getAuth) {
-      const previousToken = this.auth.accessToken;
-      this.auth = await this.options.getAuth();
-      if (previousToken !== this.auth.accessToken) this.emit("auth", this.auth);
-    }
+    if (this.loggingIn) await this.loggingIn;
+    if (this.options.getAuth) await this.readProviderAuth();
     const expiry = this.auth.expiresAt ?? (this.auth.accessToken
       ? JSON.parse(Buffer.from(this.auth.accessToken.split(".")[1], "base64url").toString()).exp * 1000
       : 0);
@@ -163,17 +202,19 @@ export class TonieCloudClient extends EventEmitter {
 
   async request<T = unknown>(method: string, path: string, body?: unknown): Promise<T> {
     assert(path.startsWith("/") && !path.startsWith("//"), "Use an API-relative path");
-    const perform = async () => this.fetcher(`${TONIES_API_URL}${path}`, {
+    const perform = async (accessToken: string) => this.fetcher(`${TONIES_API_URL}${path}`, {
       method: method.toUpperCase(),
-      headers: { Authorization: `Bearer ${await this.accessToken()}`, ...(body === undefined ? {} : { "content-type": "application/json" }) },
+      headers: { Authorization: `Bearer ${accessToken}`, ...(body === undefined ? {} : { "content-type": "application/json" }) },
       body: body === undefined ? undefined : JSON.stringify(body),
       redirect: "error",
       signal: AbortSignal.timeout(this.options.timeoutMs ?? 15000)
     });
-    let response = await perform();
+    const accessToken = await this.accessToken();
+    let response = await perform(accessToken);
     if (response.status === 401 && !this.options.getAuth) {
-      await this.refresh();
-      response = await perform();
+      await response.body?.cancel();
+      if (accessToken === this.auth.accessToken) await this.refresh();
+      response = await perform(await this.accessToken());
     }
     assert(response.ok, `Tonies ${method} ${path} failed (HTTP ${response.status})`);
     const text = await response.text();
