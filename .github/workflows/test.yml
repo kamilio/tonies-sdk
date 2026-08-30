@@ -14,4 +14,5 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm test
+      - run: npm run test:memory
       - run: npm pack --dry-run

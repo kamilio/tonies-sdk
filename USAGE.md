@@ -28,6 +28,8 @@ tonies raw operation households_read --parameters '{"id":"HOUSEHOLD"}'
 
 Existing upload, chapter-edit/reorder, identity, and directory-sync commands remain available. `creative cloud-list` is read-only; the legacy identity commands can modify local config mappings and onboard unused Creative-Tonies. Never use identity discovery just to list remote Tonies in an integration.
 
+Audio uploads use file-backed multipart bodies and fingerprints stream SHA-256 instead of buffering entire files. Local files and durations are validated before reserving an upload; do not modify a source file while it is uploading. File and directory sync analyze at most four tracks concurrently, preserve requested/natural order, and stop queued work while draining active readers if analysis fails.
+
 ## Realtime controls
 
 ```
@@ -77,5 +79,7 @@ For device confirmation, use `withConfirmation(boxId, topic, predicate, operatio
 Use `await cloud.setAuth(repairedAuth)` to adopt credentials from a new login rather than assigning the public auth field. This prevents an older in-flight refresh from replacing repaired credentials. Concurrent provider lookups and refreshes share requests; late HTTP 401 responses reuse an already rotated token instead of refreshing it again. Credential persistence is serialized, keeping only the latest waiting auth update while a write is in flight; a slow older write cannot overwrite a newer persisted login, and failed writes do not poison later saves.
 
 ## Verification
+
+`npm run test:memory` runs audio regressions with explicit garbage collection, including 128 MiB upload/hash fixtures, bounded reader concurrency, and failure drainage.
 
 `npm test` runs offline regressions, including MQTT wire payloads, state transitions, strict device filtering, authentication isolation/rotation, and low-level operation routing. An in-memory broker exercises the real MQTT client, including timeout removal and reconnect without command replay. Destructive live Creative-Tonie tests are opt-in. Actual playback and sleep-light effects must be verified with an online device; tests using a fake broker cannot establish hardware behavior.

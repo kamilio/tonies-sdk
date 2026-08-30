@@ -1,7 +1,11 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, readdir, readFile, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import fs from "node:fs";
+import { copyFile, mkdtemp, mkdir, open, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
+import { Readable } from "node:stream";
 import test from "node:test";
 import YAML from "yaml";
 import {
@@ -9,9 +13,12 @@ import {
   assertChaptersMatch,
   chaptersFromSyncPlan,
   contentTypeForFile,
+  fingerprintFile,
   hasOnlyIdentityAnnouncement,
   identityForTarget,
   listAudioFiles,
+  localTracksFromDirectories,
+  localTracksFromFiles,
   outputDirFromConfig,
   parseTarget,
   planDirectorySync,
@@ -21,6 +28,7 @@ import {
   syncFiles,
   syncTargetsFromConfig,
   updateManifestForTarget,
+  uploadFile,
   verifyChapters,
   withIdentityDatabase,
   writeIdentityDatabase,
@@ -42,6 +50,45 @@ function track(title, seconds, fingerprint = title, path = `/audio/${title}.mp3`
 
 function chapter(title, seconds, id) {
   return { id, file: id, title, seconds, type: "file" };
+}
+
+async function sparseAudio(path, bytes) {
+  const file = await open(path, "w");
+  try {
+    await file.truncate(bytes);
+  } finally {
+    await file.close();
+  }
+}
+
+function traceAudioAnalysis(context, paths) {
+  const originalStream = fs.createReadStream;
+  const originalStat = fs.promises.stat;
+  const trace = { active: 0, maximum: 0, visited: new Set() };
+  const statMock = context.mock.method(fs.promises, "stat", (...args) => {
+    if (paths.includes(args[0])) trace.visited.add(args[0]);
+    return originalStat(...args);
+  });
+  const streamMock = context.mock.method(fs, "createReadStream", (path, options) => {
+    trace.active++;
+    trace.maximum = Math.max(trace.maximum, trace.active);
+    const stream = Readable.from((async function* () {
+      await new Promise(resolve => setTimeout(resolve, 10));
+      yield* originalStream(path, options);
+    })());
+    let completed = false;
+    const finish = () => { if (!completed) { completed = true; trace.active--; } };
+    stream.once("end", finish);
+    stream.once("error", finish);
+    return stream;
+  });
+  syncBuiltinESMExports();
+  context.after(() => {
+    statMock.mock.restore();
+    streamMock.mock.restore();
+    syncBuiltinESMExports();
+  });
+  return trace;
 }
 
 function rng(seed) {
@@ -356,6 +403,177 @@ async function identityFixture(context, tonies, remainingAnimals = ["tiger", "pa
   const generateAudio = async codename => { cloud.spoken.push(codename); return audioPath; };
   return { root, cloud, audioPath, options: { rootDirectory: root, generateAudio }, databasePath: join(root, "tonies-identities.json") };
 }
+
+test("fingerprints match SHA-256 across multiple stream chunks", async context => {
+  const root = await mkdtemp(join(tmpdir(), "tonies-fingerprints-"));
+  context.after(() => rm(root, { recursive: true, force: true }));
+  const path = join(root, "audio.mp3");
+  const data = Buffer.alloc(250000, 123);
+  await writeFile(path, data);
+  assert.equal(await fingerprintFile(path), createHash("sha256").update(data).digest("hex"));
+  await writeFile(path, "");
+  assert.equal(await fingerprintFile(path), createHash("sha256").digest("hex"));
+  await assert.rejects(fingerprintFile(join(root, "missing.mp3")), { code: "ENOENT" });
+});
+
+test("large audio uploads do not allocate a whole-file multipart buffer", async context => {
+  const { root, cloud } = await identityFixture(context, []);
+  context.after(() => rm(root, { recursive: true, force: true }));
+  const path = join(root, "large.mp3");
+  const bytes = 128 * 1024 * 1024;
+  await sparseAudio(path, bytes);
+  const expected = createHash("sha256");
+  const zeros = Buffer.alloc(65536);
+  for (let offset = 0; offset < bytes; offset += zeros.length) expected.update(zeros);
+  global.gc?.();
+  const baseline = process.memoryUsage().arrayBuffers;
+  let maximum = baseline;
+  let prepared;
+  cloud.beforeRequest = async (pathname, body) => {
+    if (pathname !== "/audio") return;
+    const audio = body.get("file");
+    prepared = process.memoryUsage().arrayBuffers - baseline;
+    assert(prepared < 8 * 1024 * 1024, `Multipart preparation allocated ${prepared} bytes for a ${bytes}-byte file`);
+    assert.equal(audio.name, "blob_uploaded-1");
+    assert.equal(audio.type, "audio/mpeg");
+    assert.equal(audio.size, bytes);
+    const uploaded = createHash("sha256");
+    let chunks = 0;
+    for await (const chunk of audio.stream()) {
+      uploaded.update(chunk);
+      if (++chunks % 128 === 0) global.gc?.();
+      maximum = Math.max(maximum, process.memoryUsage().arrayBuffers);
+    }
+    assert.equal(uploaded.digest("hex"), expected.digest("hex"));
+    let multipartBytes = 0;
+    const request = new Request("https://upload.invalid/audio", { method: "POST", body });
+    for await (const chunk of request.body) {
+      multipartBytes += chunk.length;
+      if (++chunks % 128 === 0) global.gc?.();
+      maximum = Math.max(maximum, process.memoryUsage().arrayBuffers);
+    }
+    assert(multipartBytes > bytes && multipartBytes < bytes + 2048);
+  };
+  assert.deepEqual(await uploadFile(path, "Large story", 3600), { id: "blob_uploaded-1", file: "blob_uploaded-1", title: "Large story", seconds: 3600, type: "file" });
+  if (global.gc) assert(maximum - baseline < 32 * 1024 * 1024);
+  context.diagnostic(`128 MiB upload: prepared buffers ${prepared} bytes; peak buffer delta ${maximum - baseline} bytes${global.gc ? " with GC" : " (GC not forced)"}`);
+});
+
+test("large-file fingerprints keep bounded live buffers", async context => {
+  const root = await mkdtemp(join(tmpdir(), "tonies-large-fingerprint-"));
+  context.after(() => rm(root, { recursive: true, force: true }));
+  const path = join(root, "large.mp3");
+  const bytes = 128 * 1024 * 1024;
+  await sparseAudio(path, bytes);
+  const expected = createHash("sha256");
+  const zeros = Buffer.alloc(65536);
+  for (let offset = 0; offset < bytes; offset += zeros.length) expected.update(zeros);
+  global.gc?.();
+  const baseline = process.memoryUsage().arrayBuffers;
+  let maximum = baseline;
+  let samples = 0;
+  const sample = () => {
+    if (++samples % 16 === 0) global.gc?.();
+    maximum = Math.max(maximum, process.memoryUsage().arrayBuffers);
+  };
+  const timer = setInterval(sample, 1);
+  try {
+    assert.equal(await fingerprintFile(path), expected.digest("hex"));
+    sample();
+  } finally {
+    clearInterval(timer);
+  }
+  assert(maximum - baseline < 64 * 1024 * 1024, `Fingerprinting retained ${maximum - baseline} bytes of buffers`);
+  context.diagnostic(`128 MiB fingerprint: peak buffer delta ${maximum - baseline} bytes over ${samples} samples`);
+});
+
+test("uploads reject source modification before the file-backed body is read", async context => {
+  const { root, cloud, audioPath } = await identityFixture(context, []);
+  context.after(() => rm(root, { recursive: true, force: true }));
+  cloud.beforeRequest = async (pathname, body) => {
+    if (pathname !== "/audio") return;
+    await writeFile(audioPath, "changed after preparing the upload");
+    for await (const chunk of body.get("file").stream()) assert(chunk.length > 0);
+  };
+  await assert.rejects(uploadFile(audioPath, "Story", 1), { name: "NotReadableError" });
+});
+
+test("invalid local uploads fail before reserving remote files", async context => {
+  const { root, cloud, audioPath } = await identityFixture(context, []);
+  context.after(() => rm(root, { recursive: true, force: true }));
+  await assert.rejects(uploadFile(join(root, "missing.wav")), { code: "ENOENT" });
+  await assert.rejects(uploadFile(root, "Directory", 1), /not a regular file/);
+  for (const seconds of [0, -1, NaN, Infinity]) {
+    await assert.rejects(uploadFile(audioPath, "Invalid duration", seconds), /Invalid upload duration/);
+  }
+  await writeFile(audioPath, "");
+  await assert.rejects(uploadFile(audioPath, "Empty audio", 1), /Audio source is empty/);
+  await writeFile(audioPath, "invalid audio");
+  await assert.rejects(uploadFile(audioPath));
+  assert.deepEqual(cloud.requests, []);
+});
+
+test("uploads preserve parsed duration and multipart file metadata", async context => {
+  const { root, cloud, audioPath } = await identityFixture(context, []);
+  context.after(() => rm(root, { recursive: true, force: true }));
+  const uploaded = await uploadFile(audioPath);
+  assert.deepEqual(uploaded, { id: "blob_uploaded-1", file: "blob_uploaded-1", title: "identity", seconds: 1, type: "file" });
+  const file = cloud.requests.find(request => request.pathname === "/audio").body.get("file");
+  assert.equal(file.type, "audio/wav");
+  assert.equal(file.name, uploaded.file);
+  assert.equal(file.size, 16044);
+});
+
+test("audio analysis bounds concurrent readers while preserving input order", async context => {
+  const { root, audioPath } = await identityFixture(context, []);
+  context.after(() => rm(root, { recursive: true, force: true }));
+  const paths = Array.from({ length: 32 }, (_, index) => join(root, `${32 - index}.wav`));
+  await Promise.all(paths.map(path => copyFile(audioPath, path)));
+  const trace = traceAudioAnalysis(context, paths);
+  const tracks = await localTracksFromFiles(paths, root);
+  assert.deepEqual(tracks.map(track => track.path), paths);
+  assert(tracks.every(track => track.seconds === 1 && track.fingerprint === tracks[0].fingerprint));
+  assert(trace.maximum <= 4, `Opened ${trace.maximum} concurrent readers`);
+  assert.equal(trace.active, 0);
+  assert.equal(trace.visited.size, paths.length);
+});
+
+test("failed audio analysis stops queued work and drains active readers", async context => {
+  const { root, audioPath } = await identityFixture(context, []);
+  context.after(() => rm(root, { recursive: true, force: true }));
+  const paths = Array.from({ length: 32 }, (_, index) => join(root, `${index}.wav`));
+  await Promise.all(paths.slice(1).map(path => copyFile(audioPath, path)));
+  const trace = traceAudioAnalysis(context, paths);
+  await assert.rejects(localTracksFromFiles(paths, root), { code: "ENOENT" });
+  assert.equal(trace.active, 0);
+  assert(trace.visited.size <= 4, `Started ${trace.visited.size} files after a failed analysis`);
+  assert.equal((await localTracksFromFiles([audioPath], root)).length, 1);
+});
+
+test("directory audio analysis shares one reader limit and preserves natural ordering", async context => {
+  const { root, audioPath } = await identityFixture(context, []);
+  context.after(() => rm(root, { recursive: true, force: true }));
+  const directories = [join(root, "second"), join(root, "first")];
+  await Promise.all(directories.map(directory => mkdir(directory)));
+  const paths = directories.flatMap(directory => Array.from({ length: 12 }, (_, index) => join(directory, `${index + 1}.wav`)));
+  await Promise.all(paths.map(path => copyFile(audioPath, path)));
+  const trace = traceAudioAnalysis(context, paths);
+  const tracks = await localTracksFromDirectories(directories);
+  assert.deepEqual(tracks.map(track => track.path), paths);
+  assert.deepEqual(tracks.map(track => track.directory), paths.map(path => dirname(path)));
+  assert(trace.maximum <= 4, `Opened ${trace.maximum} concurrent readers across directories`);
+  assert.equal(trace.active, 0);
+  assert.deepEqual(await localTracksFromDirectories([]), []);
+  assert.deepEqual(await localTracksFromFiles([]), []);
+});
+
+test("audio analysis rejects directories before opening a reader", async context => {
+  const { root } = await identityFixture(context, []);
+  context.after(() => rm(root, { recursive: true, force: true }));
+  const trace = traceAudioAnalysis(context, [root]);
+  await assert.rejects(localTracksFromFiles([root]), /not a regular file/);
+  assert.equal(trace.maximum, 0);
+});
 
 test("animal assignments cover occupied Tonies, survive reordering and absence, and never recycle", async () => {
   const database = await readIdentityDatabase(join(await mkdtemp(join(tmpdir(), "tonies-pool-")), "identities.json"));

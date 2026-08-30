@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { existsSync } from "node:fs";
+import { createReadStream, existsSync, openAsBlob } from "node:fs";
 import { mkdir, open, readdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { basename, dirname, extname, join, relative } from "node:path";
 import { promisify } from "node:util";
@@ -138,6 +138,7 @@ export type SyncRunOptions = {
 const apiBaseUrl = "https://api.prod.tcs.toys/v2";
 const tokenUrl = "https://login.tonies.com/auth/realms/tonies/protocol/openid-connect/token";
 const audioExtensions = new Set([".mp3", ".m4a", ".m4b", ".aac", ".wav", ".flac", ".ogg", ".oga", ".opus", ".wma", ".aif", ".aiff"]);
+const audioPathCollator = new Intl.Collator(undefined, { numeric: true, sensitivity: "base" });
 export const DEFAULT_STORAGE_PATH = ".tonies-storage.json";
 export const DEFAULT_PROFILE_PATH = ".tonies-sdk-profile";
 
@@ -625,16 +626,20 @@ export function titleForFile(path: string): string {
 export async function durationForFile(path: string): Promise<number> {
   const metadata = await parseFile(path);
   const seconds = Math.ceil(metadata.format.duration ?? 0);
-  if (!seconds) throw new Error(`No duration found in ${path}`);
+  assert(Number.isFinite(seconds) && seconds > 0, `No valid duration found in ${path}`);
   return seconds;
 }
 
 export async function uploadFile(path: string, title?: string, seconds?: number): Promise<Chapter> {
+  await audioFileStat(path);
+  const duration = seconds ?? await durationForFile(path);
+  assert(Number.isFinite(duration) && duration > 0, `Invalid upload duration for ${path}`);
+  const file = await openAsBlob(path, { type: contentTypeForFile(path) });
+  assert(file.size > 0, `Audio source is empty: ${path}`);
   const upload = await getUploadRequest();
   const form = new FormData();
   for (const [key, value] of Object.entries(upload.request.fields)) form.append(key, value);
-  const buffer = await readFile(path);
-  form.append("file", new Blob([buffer], { type: contentTypeForFile(path) }), upload.fileId);
+  form.append("file", file, upload.fileId);
   const uploadResponse = await fetch(upload.request.url, { method: "POST", body: form });
   if (!uploadResponse.ok) {
     throw new Error(`File upload for ${path} failed with ${uploadResponse.status} ${uploadResponse.statusText}: ${(await uploadResponse.text()).slice(0, 500)}`);
@@ -643,19 +648,25 @@ export async function uploadFile(path: string, title?: string, seconds?: number)
     id: upload.fileId,
     file: upload.fileId,
     title: title ?? titleForFile(path),
-    seconds: seconds ?? await durationForFile(path),
+    seconds: duration,
     type: "file"
   };
 }
 
 export async function fingerprintFile(path: string): Promise<string> {
   const hash = createHash("sha256");
-  hash.update(await readFile(path));
+  for await (const chunk of createReadStream(path)) hash.update(chunk);
   return hash.digest("hex");
 }
 
-export async function localTrack(path: string, directory: string): Promise<LocalTrack> {
+async function audioFileStat(path: string) {
   const fileStat = await stat(path);
+  assert(fileStat.isFile(), `Audio source is not a regular file: ${path}`);
+  return fileStat;
+}
+
+export async function localTrack(path: string, directory: string): Promise<LocalTrack> {
+  const fileStat = await audioFileStat(path);
   return {
     path,
     directory,
@@ -702,16 +713,34 @@ export async function writeRemoteSnapshot(manifestPath: string, householdId: str
   return path;
 }
 
+async function analyzeTracks(entries: Array<{ path: string; directory: string }>): Promise<LocalTrack[]> {
+  function* tasks() {
+    yield* entries.entries();
+  }
+  const pending = tasks();
+  const tracks = new Array<LocalTrack>(entries.length);
+  const workers = Array.from({ length: Math.min(4, entries.length) }, async () => {
+    for (const [index, entry] of pending) tracks[index] = await localTrack(entry.path, entry.directory);
+  });
+  const drained = Promise.allSettled(workers);
+  try {
+    await Promise.all(workers);
+  } finally {
+    await drained;
+  }
+  return tracks;
+}
+
 export async function localTracksFromDirectories(dirs: string[]): Promise<LocalTrack[]> {
-  const groups = await Promise.all(dirs.map(async (dir) => {
-    const files = await listAudioFiles(dir);
-    return Promise.all(files.map((file) => localTrack(file, dir)));
-  }));
-  return groups.flat();
+  const entries: Array<{ path: string; directory: string }> = [];
+  for (const directory of dirs) {
+    for (const path of await listAudioFiles(directory)) entries.push({ path, directory });
+  }
+  return analyzeTracks(entries);
 }
 
 export async function localTracksFromFiles(files: string[], directory?: string): Promise<LocalTrack[]> {
-  return Promise.all(files.map((file) => localTrack(file, directory ?? dirname(file))));
+  return analyzeTracks(files.map((path) => ({ path, directory: directory ?? dirname(path) })));
 }
 
 export function reorderChapters(chapters: Chapter[], chapterIds: string[]): Chapter[] {
@@ -730,13 +759,16 @@ export async function readYaml(path: string): Promise<Record<string, unknown>> {
 }
 
 export async function listAudioFiles(dir: string): Promise<string[]> {
-  const entries = await readdir(dir, { withFileTypes: true });
-  const groups = await Promise.all(entries.map(async (entry) => {
-    const path = `${dir.replace(/\/$/, "")}/${entry.name}`;
-    if (entry.isDirectory()) return listAudioFiles(path);
-    return audioExtensions.has(extname(entry.name).toLowerCase()) ? [path] : [];
-  }));
-  return groups.flat().sort((a, b) => a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" }));
+  const files: string[] = [];
+  async function visit(directory: string): Promise<void> {
+    for (const entry of await readdir(directory, { withFileTypes: true })) {
+      const path = `${directory.replace(/\/$/, "")}/${entry.name}`;
+      if (entry.isDirectory()) await visit(path);
+      else if (audioExtensions.has(extname(entry.name).toLowerCase())) files.push(path);
+    }
+  }
+  await visit(dir);
+  return files.sort(audioPathCollator.compare);
 }
 
 function recordValue(value: unknown): Record<string, unknown> {
