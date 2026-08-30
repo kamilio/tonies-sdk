@@ -220,6 +220,46 @@ test("failed credential persistence does not poison subsequent saves", async () 
   assert.equal((await cloud.setAuth({ accessToken: "repaired" })).accessToken, "repaired");
 });
 
+test("flushing authentication drains refresh and credential persistence without starting requests", async () => {
+  const token = deferred();
+  const persistence = deferred();
+  const saving = deferred();
+  let requests = 0;
+  const cloud = new TonieCloudClient({ auth: { accessToken: "old", refreshToken: "refresh" }, fetch: () => { requests++; return token.promise; }, onAuth: () => { saving.resolve(); return persistence.promise; } });
+  assert.equal((await cloud.flushAuth()).accessToken, "old");
+  assert.equal(requests, 0);
+  const refreshed = cloud.refresh();
+  let flushed = false;
+  const flushing = cloud.flushAuth().then(auth => { flushed = true; return auth; });
+  token.resolve(response({ access_token: "new", refresh_token: "rotated", expires_in: 300 }));
+  await saving.promise;
+  assert.equal(flushed, false);
+  persistence.resolve();
+  await refreshed;
+  assert.equal((await flushing).refreshToken, "rotated");
+  assert.equal(requests, 1);
+  assert.equal((await cloud.flushAuth()).accessToken, "new");
+  assert.equal(requests, 1);
+});
+
+test("flushing authentication drains independent persistence even when refresh fails", async () => {
+  const token = deferred();
+  const persistence = deferred();
+  const cloud = new TonieCloudClient({ auth: { refreshToken: "refresh" }, fetch: () => token.promise, onAuth: () => persistence.promise });
+  const saved = cloud.setAuth({ refreshToken: "refresh" });
+  const refreshed = assert.rejects(cloud.refresh(), /refresh failed/);
+  let flushed = false;
+  const flushing = assert.rejects(cloud.flushAuth(), /refresh failed/).then(() => { flushed = true; });
+  token.reject(new Error("refresh failed"));
+  await refreshed;
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(flushed, false);
+  persistence.resolve();
+  await saved;
+  await flushing;
+  assert.equal((await cloud.flushAuth()).refreshToken, "refresh");
+});
+
 test("SDK surfaces HTTP and GraphQL failures rather than false success", async () => {
   const auth = { accessToken: jwt() };
   await assert.rejects(new TonieCloudClient({ auth, fetch: async () => new Response(null, { status: 403 }) }).request("GET", "/me"), /403/);

@@ -126,6 +126,13 @@ export class TonieCloudClient extends EventEmitter {
     return this.saveAuth(auth, revision);
   }
 
+  async flushAuth(): Promise<ToniesAuth> {
+    const results = await Promise.allSettled([this.refreshing, this.loggingIn, this.providerAuth, this.writingAuth?.promise]);
+    const failed = results.find(result => result.status === "rejected");
+    if (failed?.status === "rejected") throw failed.reason;
+    return this.auth;
+  }
+
   private saveAuth(auth: ToniesAuth, revision: number): Promise<ToniesAuth> {
     this.auth = auth;
     if (this.writingAuth) {

@@ -6,6 +6,8 @@ Install from this repository with Node 20.5 or later, run `npm install`, then us
 
 Set `TONIES_EMAIL` and `TONIES_PASSWORD`, then run `tonies auth login`. The desktop CLI also reads existing Playwright storage or `TONIES_ACCESS_TOKEN` / `TONIES_REFRESH_TOKEN`. Keep `.tonies-storage.json` private. Cloud-only integrations use `TonieCloudClient` with instance-specific tokens and an `onAuth` callback; they do not use browser profiles or filesystem credentials.
 
+Before discarding a cloud client, stop its realtime connection and other request producers, then await `cloud.flushAuth()`. This drains already-started authentication and token persistence without starting a new request, so an in-flight refresh cannot lose its rotated refresh token during teardown. Keep the persistence callback active until draining finishes, and serialize replacement clients behind that barrier. Authentication or persistence failures still reject after the pending work settles.
+
 ## Management
 
 ```
